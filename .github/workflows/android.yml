@@ -149,7 +149,7 @@ jobs:
           echo "signed with $got"
           [ "$got" = "$want" ] || { echo "::error::APK certificate $got is not the published $want"; exit 1; }
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: Spektralab-X-${{ steps.version.outputs.version }}-run${{ github.run_number }}
           path: dist/*

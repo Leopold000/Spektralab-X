@@ -60,7 +60,7 @@ jobs:
           UP="$PWD/upstream" B="$PWD/build-fir" BUILD_DIR="$PWD/fir-tests" \
             bash tools/native/run_fir_rows.sh > fir-evidence/fir.csv 2> fir-evidence/fir.log
           cat fir-evidence/fir.log fir-evidence/fir.csv
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: fir-rows-${{ github.sha }}
