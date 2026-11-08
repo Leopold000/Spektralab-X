@@ -34,7 +34,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends glslang-tools mesa-vulkan-drivers ninja-build
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: upstream
           key: upstream-${{ hashFiles('scripts/fetch-upstream.sh', 'patches/*.patch') }}
