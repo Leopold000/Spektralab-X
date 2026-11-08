@@ -876,6 +876,7 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
             outPixels = outPixels,
             frameJson = if (state.edit.frame.isNone) "" else state.edit.frame.toJson().toString(),
             filmLabel = if (state.edit.noFilm) "" else state.catalog.film(state.edit.film)?.label ?: "",
+            edgeRealName = state.edit.edgeRealName,
             wideGamut = state.wideGamut,
             highlightStops = state.highlightStops,
         )
@@ -905,6 +906,7 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
             outPixels = if (state.maxPixels > 0) minOf(px, state.maxPixels) else px,
             frameJson = if (state.edit.frame.isNone) "" else state.edit.frame.toJson().toString(),
             filmLabel = if (state.edit.noFilm) "" else state.catalog.film(state.edit.film)?.label ?: "",
+            edgeRealName = state.edit.edgeRealName,
             wideGamut = state.wideGamut,
             highlightStops = state.highlightStops,
             extreme = true,

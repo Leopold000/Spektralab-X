@@ -57,6 +57,11 @@ data class ProcessingJob(
     /** The paper frame (FrameSpec JSON, "" = none) and the film's name for its caption. */
     val frameJson: String = "",
     val filmLabel: String = "",
+    /**
+     * Whether the film edge prints the stock's real name (UI.md E.1). The toggle
+     * is app-side, so the engine params cannot carry it; the job must.
+     */
+    val edgeRealName: Boolean = true,
     /** A JPEG rendered and tagged in Display P3 rather than sRGB. */
     val wideGamut: Boolean = false,
     /** Highlight recovery the editor opened the phone photo with. */
@@ -113,7 +118,7 @@ data class ProcessingJob(
         .put("id", id).put("uri", uri).put("name", name).put("raw", raw).put("edit", editJson)
         .put("wbK", wbK).put("wbTint", wbTint).put("format", format.name).put("size", size.name)
         .put("edge", workingEdge).put("maxPixels", maxPixels).put("outPixels", outPixels)
-        .put("frame", frameJson).put("filmLabel", filmLabel).put("wide", wideGamut).put("hl", highlightStops.toDouble()).put("look", lookJson)
+        .put("frame", frameJson).put("filmLabel", filmLabel).put("realName", edgeRealName).put("wide", wideGamut).put("hl", highlightStops.toDouble()).put("look", lookJson)
         .put("state", state.name).put("message", message).put("attempts", attempts)
         .put("createdAt", createdAt).put("finishedAt", finishedAt)
         .put("src", sourcePath).put("persisted", persisted).put("secured", secured).put("pending", pendingUri)
@@ -129,6 +134,7 @@ data class ProcessingJob(
                 format = ExportFormat.valueOf(o.getString("format")), size = ExportSize.valueOf(o.getString("size")),
                 workingEdge = o.optInt("edge"), maxPixels = o.optLong("maxPixels"), outPixels = o.optLong("outPixels"),
                 frameJson = o.optString("frame"), filmLabel = o.optString("filmLabel"),
+                edgeRealName = o.optBoolean("realName", true),
                 wideGamut = o.optBoolean("wide"),
                 highlightStops = o.optDouble("hl", 0.0).toFloat(),
                 lookJson = o.optString("look"),
@@ -663,7 +669,10 @@ class ProcessingQueue(private val app: Application, private val host: EngineHost
         val parsed = Edit.fromParams(JSONObject(job.editJson), Edit())
         val ready = host.start(parsed.film, parsed.paper)
         val engine = ready.engine
-        val edit = ready.catalog.normalize(parsed)
+        // The catalog fills the edge print back in from the film and gauge; the
+        // app-side toggle decides whether it reaches the engine. The wire cannot
+        // carry that toggle, so it rides on the job (Edit.edgeRealName).
+        val edit = ready.catalog.normalize(parsed).let { if (job.edgeRealName) it else it.copy(edgeText = "") }
         // The copy made at enqueue when the URI's grant could not be kept.
         val local = job.sourcePath.takeIf { it.isNotEmpty() }?.let(::File)?.takeIf { it.isFile }
         val uri = if (local != null) Uri.fromFile(local) else Uri.parse(job.uri)

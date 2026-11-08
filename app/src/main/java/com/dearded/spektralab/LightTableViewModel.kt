@@ -377,6 +377,7 @@ class LightTableViewModel(private val app: Application) : AndroidViewModel(app) 
             outPixels = outPixels,
             frameJson = if (edit.frame.isNone) "" else edit.frame.toJson().toString(),
             filmLabel = if (edit.noFilm) "" else ui.catalog.film(edit.film)?.label ?: "",
+            edgeRealName = edit.edgeRealName,
             wideGamut = ui.wideGamut, highlightStops = ui.highlightStops,
         )
     }
