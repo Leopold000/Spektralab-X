@@ -39,17 +39,20 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -70,6 +73,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.launch
 
 private val WORKING_EDGES = listOf(
     2048 to "2048 px",
@@ -136,6 +140,9 @@ fun SettingsScreen(ui: UiState, vm: EditorViewModel, onClose: () -> Unit) {
             val prefs = remember(context) { context.getSharedPreferences("settings", 0) }
             var expandAll by remember { mutableStateOf(prefs.getBoolean(EXPAND_ALL, false)) }
             val coach = LocalCoach.current
+            val scope = rememberCoroutineScope()
+            var tileBench by remember { mutableStateOf<String?>(null) }
+            var tileBenchRunning by remember { mutableStateOf(false) }
             SettingsGroup("编辑", buildList<@Composable () -> Unit> {
                 add {
                     SettingRow(
@@ -263,9 +270,35 @@ fun SettingsScreen(ui: UiState, vm: EditorViewModel, onClose: () -> Unit) {
                         clipboard.setText(AnnotatedString(vm.diagnostics())); copied = true
                     }
                 },
+                {
+                    ActionRow(
+                        if (tileBenchRunning) "正在测试分块…" else "高像素分块测试（实验）",
+                        "用当前照片按 2048 px 长边重开一块，只测打开和渲染时间，不改编辑。",
+                    ) {
+                        if (!tileBenchRunning) {
+                            tileBenchRunning = true
+                            tileBench = null
+                            scope.launch {
+                                try {
+                                    tileBench = vm.benchmarkTile()
+                                } finally {
+                                    tileBenchRunning = false
+                                }
+                            }
+                        }
+                    }
+                },
                 { Column(Modifier.padding(vertical = 12.dp)) { AboutSection() } },
             ))
             Spacer(Modifier.height(24.dp))
+            tileBench?.let { result ->
+                AlertDialog(
+                    onDismissRequest = { tileBench = null },
+                    confirmButton = { TextButton(onClick = { tileBench = null }) { Text("好") } },
+                    title = { Text("分块测试") },
+                    text = { Text(result, style = MaterialTheme.typography.bodySmall) },
+                )
+            }
         }
     }
 }

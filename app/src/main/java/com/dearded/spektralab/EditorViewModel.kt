@@ -6,6 +6,7 @@ import android.graphics.Bitmap
 import android.graphics.ColorSpace
 import android.graphics.ImageDecoder
 import android.net.Uri
+import android.os.SystemClock
 import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -1334,6 +1335,108 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * Experimental, read-only: opens the current photo again at a 2048 px long
+     * edge with the current film and paper and no border, renders one full
+     * frame, and reports the timings. It uses a throwaway session, so the
+     * editor's own session, undo history and rendered preview are untouched.
+     * This checks whether one tile fits and how long it takes; it does not
+     * stitch tiles or claim to export high-resolution photos.
+     */
+    suspend fun benchmarkTile(): String {
+        val state = _ui.value
+        val uri = lastUri ?: return "先在编辑器里打开一张照片"
+        val src = state.source ?: return "照片还没打开完"
+        val engineHandle = engine
+        if (engineHandle == 0L) return "引擎还没准备好"
+        val catalog = state.catalog
+        val film = state.edit.film.takeIf { it.isNotEmpty() && catalog.film(it) != null }
+            ?: catalog.films.firstOrNull()?.id ?: return "没有可用的胶片"
+        val base = withFilm(state.edit, catalog, film) ?: return "胶片不可用：$film"
+        val tileEdit = catalog.normalize(base.copy(
+            quarterTurns = 0, flipH = false,
+            cropX = 0.0, cropY = 0.0, cropW = 1.0, cropH = 1.0, cropAspect = 0.0,
+            filmEdge = false, dateImprint = false, borderId = "none", frame = FrameSpec(),
+        ))
+        val params = Edit.openingParams(tileEdit, inputSpace = INPUT_SPACE, linear = true).toString()
+        val started = SystemClock.elapsedRealtime()
+        var handle = 0L
+        var openError = ""
+        try {
+            if (src.kind == "raw") {
+                var input: RawInput? = null
+                try {
+                    input = withContext(Dispatchers.IO) { loader.rawInput(uri, src.name) }
+                    val raw = input ?: throw EngineException("无法读取该文件")
+                    handle = withContext(ExportThread.dispatcher) {
+                        val h = NativeEngine.openRaw(engineHandle, raw.path, BENCH_EDGE, 0, params, src.wbK, src.wbTint)
+                        if (h == 0L) openError = NativeEngine.lastError()
+                        h
+                    }
+                } finally {
+                    runCatching { input?.close() }
+                }
+            } else {
+                val photo = withContext(Dispatchers.IO) { loader.decodePhoto(uri, BENCH_EDGE, 0) }
+                handle = withContext(ExportThread.dispatcher) {
+                    val h = openPhotoSession(engineHandle, photo, state.highlightStops) { space, linear ->
+                        Edit.openingParams(tileEdit, inputSpace = space, linear = linear).toString()
+                    }.handle
+                    if (h == 0L) openError = NativeEngine.lastError()
+                    h
+                }
+            }
+            val openMs = SystemClock.elapsedRealtime() - started
+            if (handle == 0L) return "分块测试失败：${openError.ifEmpty { "打开失败" }}"
+            val bench = withContext(ExportThread.dispatcher) {
+                NativeEngine.setOutput(handle, "sRGB", false)
+                val firstStart = SystemClock.elapsedRealtime()
+                val first = NativeEngine.renderBitmap(handle, "full")
+                val firstMs = SystemClock.elapsedRealtime() - firstStart
+                if (first == null) return@withContext Bench(-1, -1, 0, 0, NativeEngine.lastError())
+                val secondStart = SystemClock.elapsedRealtime()
+                val second = NativeEngine.renderBitmap(handle, "full")
+                val secondMs = SystemClock.elapsedRealtime() - secondStart
+                val w = first.width
+                val h = first.height
+                first.recycle()
+                second?.recycle()
+                Bench(firstMs, if (second != null) secondMs else -1, w, h,
+                    if (second == null) NativeEngine.lastError() else "")
+            }
+            if (bench.firstMs < 0) return "分块测试失败：${bench.error.ifEmpty { "渲染失败" }}"
+            val mp = bench.w.toDouble() * bench.h / 1_000_000.0
+            val tileMp = BENCH_EDGE.toDouble() * BENCH_EDGE / 1_000_000.0
+            val steady = if (bench.secondMs >= 0) bench.secondMs else bench.firstMs
+            val estimate = if (mp > 0) (steady * tileMp / mp).roundToInt() else steady
+            val text = buildString {
+                append("单块测试（${BENCH_EDGE} px 长边）\n")
+                append("来源：${src.kind.uppercase(Locale.ROOT)} ${src.sourceWidth}×${src.sourceHeight}\n")
+                append("打开：${openMs} ms\n")
+                append("首帧：${bench.firstMs} ms\n")
+                if (bench.secondMs >= 0) append("热帧：${bench.secondMs} ms\n")
+                append("输出：${bench.w}×${bench.h}（%.1f MP）\n".format(Locale.ROOT, mp))
+                append("按 ${BENCH_EDGE}×${BENCH_EDGE} 一块估算：约 $estimate ms\n")
+                append("只测单块，未拼图；接缝和整图导出下一步。")
+            }
+            log("tile bench: $text")
+            return text
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: OutOfMemoryError) {
+            return "分块测试失败：内存不足，连 ${BENCH_EDGE} px 单块都放不下"
+        } catch (e: Throwable) {
+            return "分块测试失败：${e.message ?: e}"
+        } finally {
+            if (handle != 0L) withContext(kotlinx.coroutines.NonCancellable + ExportThread.dispatcher) {
+                NativeEngine.release(handle)
+            }
+        }
+    }
+
+    /** One tile's measured times and output size; [error] when the second render failed. */
+    private data class Bench(val firstMs: Long, val secondMs: Long, val w: Int, val h: Int, val error: String)
+
     // --- imported styles and films (StyleImport.kt) ------------------------------
 
     /** After a film import: the engine directory's profiles read again, so the new stock is listed. */
@@ -1388,6 +1491,8 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
         private const val kMaxUndo = 50
         private const val kHotHeadroom = 0.85f
         private const val kMaxDetailPixels = 16_000_000L
+        /** The experimental tile benchmark's long edge; one 2048 px frame is ~3 MP in 3:2. */
+        private const val BENCH_EDGE = 2048
         /** The engine's preview tier, which the share size exports. */
         private const val SHARE_EDGE = 3400.0
 
