@@ -143,6 +143,8 @@ fun SettingsScreen(ui: UiState, vm: EditorViewModel, onClose: () -> Unit) {
             val scope = rememberCoroutineScope()
             var tileBench by remember { mutableStateOf<String?>(null) }
             var tileBenchRunning by remember { mutableStateOf(false) }
+            var seamResult by remember { mutableStateOf<String?>(null) }
+            var seamRunning by remember { mutableStateOf(false) }
             SettingsGroup("编辑", buildList<@Composable () -> Unit> {
                 add {
                     SettingRow(
@@ -288,6 +290,24 @@ fun SettingsScreen(ui: UiState, vm: EditorViewModel, onClose: () -> Unit) {
                         }
                     }
                 },
+                {
+                    ActionRow(
+                        if (seamRunning) "正在测试接缝…" else "高像素接缝测试（实验）",
+                        "把当前照片切成 2×2 带重叠的块，分别冲洗后比较接缝；不改编辑。",
+                    ) {
+                        if (!seamRunning) {
+                            seamRunning = true
+                            seamResult = null
+                            scope.launch {
+                                try {
+                                    seamResult = vm.seamTest()
+                                } finally {
+                                    seamRunning = false
+                                }
+                            }
+                        }
+                    }
+                },
                 { Column(Modifier.padding(vertical = 12.dp)) { AboutSection() } },
             ))
             Spacer(Modifier.height(24.dp))
@@ -296,6 +316,14 @@ fun SettingsScreen(ui: UiState, vm: EditorViewModel, onClose: () -> Unit) {
                     onDismissRequest = { tileBench = null },
                     confirmButton = { TextButton(onClick = { tileBench = null }) { Text("好") } },
                     title = { Text("分块测试") },
+                    text = { Text(result, style = MaterialTheme.typography.bodySmall) },
+                )
+            }
+            seamResult?.let { result ->
+                AlertDialog(
+                    onDismissRequest = { seamResult = null },
+                    confirmButton = { TextButton(onClick = { seamResult = null }) { Text("好") } },
+                    title = { Text("接缝测试") },
                     text = { Text(result, style = MaterialTheme.typography.bodySmall) },
                 )
             }

@@ -27,6 +27,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -1437,6 +1438,235 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
     /** One tile's measured times and output size; [error] when the second render failed. */
     private data class Bench(val firstMs: Long, val secondMs: Long, val w: Int, val h: Int, val error: String)
 
+    /**
+     * Experimental, read-only: cuts four overlapping tiles from the current
+     * photo (2x2) and renders each one as its own film+paper session, with auto
+     * exposure, grain, halation, glare, scanner sharpening, border and film
+     * edge off. The overlapping pixels are compared where the stitched image
+     * would join them. A throwaway session per tile, so the editor's session,
+     * undo history and preview are untouched.
+     *
+     * This answers the one question the single-tile benchmark cannot: is the
+     * film pipeline the same on every tile? If it is, tiles can be butted
+     * together or blended; if not, a tiled export needs global statistics or a
+     * wider blend. RAW is not supported here: cropping a RAW needs a native
+     * decode path, not a Bitmap crop.
+     */
+    suspend fun seamTest(): String {
+        val state = _ui.value
+        val uri = lastUri ?: return "先在编辑器里打开一张照片"
+        val src = state.source ?: return "照片还没打开完"
+        if (src.kind == "raw") return "接缝测试目前只支持 JPEG/PNG/HEIC；RAW 需要原生裁切，下一步再做"
+        val engineHandle = engine
+        if (engineHandle == 0L) return "引擎还没准备好"
+        val catalog = state.catalog
+        val film = state.edit.film.takeIf { it.isNotEmpty() && catalog.film(it) != null }
+            ?: catalog.films.firstOrNull()?.id ?: return "没有可用的胶片"
+        val stock = catalog.film(film) ?: return "胶片不可用：$film"
+        val base = withFilm(state.edit, catalog, film) ?: return "胶片不可用：$film"
+        val paperId = base.paper.takeIf { catalog.paper(it)?.bw == stock.bw }
+            ?: stock.targetPrint?.takeIf { catalog.paper(it)?.bw == stock.bw }
+            ?: catalog.papers.firstOrNull { it.bw == stock.bw }?.id
+            ?: return "没有与胶片匹配的相纸"
+        val paperLabel = catalog.paper(paperId)?.label ?: paperId
+        // A normal print path, not a slide scan or a digital intermediate.
+        val testEdit = catalog.normalize(base.copy(
+            paper = paperId,
+            noFilm = false,
+            scanFilm = stock.positive,
+            digitalIntermediate = false,
+            autoExposure = false,
+            exposureEv = 0.0,
+            labLevels = false,
+            quarterTurns = 0, flipH = false,
+            cropX = 0.0, cropY = 0.0, cropW = 1.0, cropH = 1.0, cropAspect = 0.0,
+            filmEdge = false, dateImprint = false, borderId = "none", frame = FrameSpec(),
+        ).withoutEffects())
+
+        var photo: Photo? = null
+        val tiles = ArrayList<SeamTile>(4)
+        try {
+            val decodeStart = SystemClock.elapsedRealtime()
+            val decoded = withContext(Dispatchers.IO) { loader.decodePhoto(uri, SEAM_EDGE, 0) }
+            photo = decoded
+            decoded.gain?.recycle()
+            val decodeMs = SystemClock.elapsedRealtime() - decodeStart
+            val bitmap = decoded.bitmap
+            val w = bitmap.width
+            val h = bitmap.height
+            val splitX = w / 2
+            val splitY = h / 2
+            if (splitX < 128 || splitY < 128) return "照片太小，接缝测试至少需要 256×256"
+            // At most a quarter of the short side, so the overlap never eats the core.
+            val margin = min(SEAM_MARGIN, min(splitX, splitY) / 2)
+            if (margin < 8) return "照片太小，接缝测试需要更大的图"
+            val rects = listOf(
+                intArrayOf(0, 0, splitX + margin, splitY + margin),
+                intArrayOf(splitX - margin, 0, w, splitY + margin),
+                intArrayOf(0, splitY - margin, splitX + margin, h),
+                intArrayOf(splitX - margin, splitY - margin, w, h),
+            )
+            var totalOpen = 0L
+            var totalRender = 0L
+            for ((i, r) in rects.withIndex()) {
+                var crop = Bitmap.createBitmap(bitmap, r[0], r[1], r[2] - r[0], r[3] - r[1])
+                if (crop === bitmap) {
+                    crop = crop.copy(Bitmap.Config.ARGB_8888, false)
+                        ?: return "接缝测试失败：无法复制分块"
+                }
+                val handle = LongArray(1)
+                val error = arrayOf("")
+                try {
+                    val openMs = withContext(ExportThread.dispatcher) {
+                        val start = SystemClock.elapsedRealtime()
+                        val opened = openPhotoSession(engineHandle, Photo(crop, decoded.space), 0f) { space, linear ->
+                            Edit.openingParams(testEdit, inputSpace = space, linear = linear).toString()
+                        }
+                        handle[0] = opened.handle
+                        if (opened.handle == 0L) error[0] = NativeEngine.lastError()
+                        SystemClock.elapsedRealtime() - start
+                    }
+                    if (handle[0] == 0L) return "接缝测试失败：${error[0].ifEmpty { "打开第 ${i + 1} 块失败" }}"
+                    val rendered = withContext(ExportThread.dispatcher) {
+                        val ok = NativeEngine.setOutput(handle[0], "sRGB", true)
+                        if (!ok) error[0] = NativeEngine.lastError()
+                        val start = SystemClock.elapsedRealtime()
+                        val out = if (ok) NativeEngine.renderBitmap(handle[0], "full") else null
+                        val ms = SystemClock.elapsedRealtime() - start
+                        if (out == null && ok) error[0] = NativeEngine.lastError()
+                        out to ms
+                    }
+                    val out = rendered.first
+                    if (out == null) return "接缝测试失败：${error[0].ifEmpty { "渲染第 ${i + 1} 块失败" }}"
+                    if (out.width != r[2] - r[0] || out.height != r[3] - r[1])
+                        return "接缝测试失败：第 ${i + 1} 块输出 ${out.width}×${out.height} " +
+                            "与分块 ${r[2] - r[0]}×${r[3] - r[1]} 不一致"
+                    totalOpen += openMs
+                    totalRender += rendered.second
+                    tiles += SeamTile(out, r[0], r[1])
+                } finally {
+                    if (handle[0] != 0L) withContext(kotlinx.coroutines.NonCancellable + ExportThread.dispatcher) {
+                        NativeEngine.release(handle[0])
+                    }
+                }
+            }
+            if (tiles.size != 4) return "接缝测试失败：分块没有全部生成"
+
+            val tl = tiles[0]
+            val tr = tiles[1]
+            val bl = tiles[2]
+            val br = tiles[3]
+            // The whole overlap: catches a global shift anywhere in the strip.
+            val topAll = seamDiff(tl.bitmap, splitX - margin, 0, tr.bitmap, 0, 0, 2 * margin, splitY + margin)
+            val bottomAll = seamDiff(bl.bitmap, splitX - margin, 0, br.bitmap, 0, 0,
+                2 * margin, h - (splitY - margin))
+            val leftAll = seamDiff(tl.bitmap, 0, splitY - margin, bl.bitmap, 0, 0,
+                splitX + margin, 2 * margin)
+            val rightAll = seamDiff(tr.bitmap, 0, splitY - margin, br.bitmap, 0, 0,
+                w - (splitX - margin), 2 * margin)
+            // The band the stitched image actually joins: what the eye can see.
+            val half = min(SEAM_BAND / 2, margin)
+            val band = 2 * half
+            val top = seamDiff(tl.bitmap, splitX - half, 0, tr.bitmap, margin - half, 0,
+                band, splitY + margin)
+            val bottom = seamDiff(bl.bitmap, splitX - half, 0, br.bitmap, margin - half, 0,
+                band, h - (splitY - margin))
+            val left = seamDiff(tl.bitmap, 0, splitY - half, bl.bitmap, 0, margin - half,
+                splitX + margin, band)
+            val right = seamDiff(tr.bitmap, 0, splitY - half, br.bitmap, 0, margin - half,
+                w - (splitX - margin), band)
+
+            val centers = listOf(top, bottom, left, right)
+            val worstMax = centers.maxOf { it.max }
+            val worstMean = centers.maxOf { it.mean }
+            val worstBias = centers.maxOf { abs(it.bias) }
+            val verdict = when {
+                worstMax <= 2 && worstMean <= 1.0 ->
+                    "接缝可忽略（≤2 级），可以按块直接拼接"
+                worstMax <= 6 ->
+                    "差异轻微（最大 $worstMax 级），建议拼接时重叠 16–32 px 融合"
+                else ->
+                    "差异明显（最大 $worstMax 级），需要融合或全图统计"
+            }
+            fun line(s: SeamDiff) = "平均 %.1f · p99 %d · 最大 %d".format(Locale.ROOT, s.mean, s.p99, s.max)
+            fun allLine(s: SeamDiff) = "平均 %.1f · 最大 %d".format(Locale.ROOT, s.mean, s.max)
+            val text = buildString {
+                append("接缝测试（2×2 · 重叠 ${margin} px）\n")
+                append("来源：${src.kind.uppercase(Locale.ROOT)} ${src.sourceWidth}×${src.sourceHeight} → ${w}×${h}\n")
+                append("胶片：${stock.label} / 相纸：$paperLabel\n")
+                append("自动曝光关 · 效果关 · 无边框/片边 · 不含调整层\n")
+                append("单块约 ${splitX + margin}×${splitY + margin}（%.1f MP）\n"
+                    .format(Locale.ROOT, (splitX + margin).toDouble() * (splitY + margin) / 1_000_000.0))
+                append("解码 $decodeMs ms · 打开均 ${totalOpen / 4} ms · 渲染均 ${totalRender / 4} ms\n")
+                append("拼接带（中心 ${band} px）：\n")
+                append("  上 ${line(top)}\n")
+                append("  下 ${line(bottom)}\n")
+                append("  左 ${line(left)}\n")
+                append("  右 ${line(right)}\n")
+                append("整段重叠（参考）：上 ${allLine(topAll)} · 下 ${allLine(bottomAll)}\n")
+                append("  左 ${allLine(leftAll)} · 右 ${allLine(rightAll)}\n")
+                append("最大亮度偏移：%.2f 级\n".format(Locale.ROOT, worstBias))
+                append("判定：$verdict\n")
+                append("只比较相邻块，不改编辑；RAW 需要原生裁切。")
+            }
+            log("seam test: $text")
+            return text
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: OutOfMemoryError) {
+            return "接缝测试失败：内存不足，放不下 ${SEAM_EDGE} px 的源图和分块"
+        } catch (e: Throwable) {
+            return "接缝测试失败：${e.message ?: e}"
+        } finally {
+            for (t in tiles) t.bitmap.recycle()
+            photo?.recycle()
+        }
+    }
+
+    /** One rendered tile and where its top-left corner sits in the decoded source. */
+    private data class SeamTile(val bitmap: Bitmap, val x0: Int, val y0: Int)
+
+    /** Overlap difference in 8-bit levels; [bias] is the signed mean luminance difference. */
+    private data class SeamDiff(val mean: Double, val p99: Int, val max: Int, val bias: Double)
+
+    /**
+     * Compares the same source rectangle in two rendered tiles. Local coordinates
+     * are given per tile, so no scaling is involved: the crops are 1:1 pixels.
+     */
+    private fun seamDiff(
+        a: Bitmap, ax: Int, ay: Int, b: Bitmap, bx: Int, by: Int, w: Int, h: Int,
+    ): SeamDiff {
+        val n = w * h
+        val pa = IntArray(n)
+        val pb = IntArray(n)
+        a.getPixels(pa, 0, w, ax, ay, w, h)
+        b.getPixels(pb, 0, w, bx, by, w, h)
+        val hist = IntArray(256)
+        var sum = 0.0
+        var bias = 0.0
+        var maxD = 0
+        for (i in 0 until n) {
+            val p = pa[i]
+            val q = pb[i]
+            val dr = ((p shr 16) and 0xFF) - ((q shr 16) and 0xFF)
+            val dg = ((p shr 8) and 0xFF) - ((q shr 8) and 0xFF)
+            val db = (p and 0xFF) - (q and 0xFF)
+            val d = max(abs(dr), max(abs(dg), abs(db)))
+            hist[d]++
+            sum += d
+            bias += 0.2126 * dr + 0.7152 * dg + 0.0722 * db
+            if (d > maxD) maxD = d
+        }
+        var acc = 0
+        var p99 = 0
+        val target = (n * 0.99).toInt().coerceAtLeast(1)
+        for (d in 0..255) {
+            acc += hist[d]
+            if (acc >= target) { p99 = d; break }
+        }
+        return SeamDiff(sum / n, p99, maxD, bias / n)
+    }
+
     // --- imported styles and films (StyleImport.kt) ------------------------------
 
     /** After a film import: the engine directory's profiles read again, so the new stock is listed. */
@@ -1493,6 +1723,16 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
         private const val kMaxDetailPixels = 16_000_000L
         /** The experimental tile benchmark's long edge; one 2048 px frame is ~3 MP in 3:2. */
         private const val BENCH_EDGE = 2048
+        /**
+         * The 2x2 seam test decodes the photo once at this long edge, then cuts
+         * four overlapping tiles from it. At 4096 px a 3:2 frame's tile is about
+         * 3.6 MP, below the 8.4 MP engine cap with room for the film pipeline.
+         */
+        private const val SEAM_EDGE = 4096
+        /** Pixels of overlap on each side of a seam; enough to see edge effects, still small. */
+        private const val SEAM_MARGIN = 128
+        /** The band around a seam that the final stitched image would actually show. */
+        private const val SEAM_BAND = 32
         /** The engine's preview tier, which the share size exports. */
         private const val SHARE_EDGE = 3400.0
 
