@@ -114,8 +114,8 @@ private:
 // `look`, on up to eight threads.
 void pack_rgba8_look(const Layer2& look, const uint16_t* src, size_t src_stride_px,
                      uint32_t w, uint32_t h, uint8_t* out, size_t out_stride,
-                     const OutputCancel& cancel = {}, const Window& window = {});
+                     const OutputCancel& cancel = {}, const Layer2::Window& window = {});
 void apply_rgba16_in_place(const Layer2& look, uint16_t* px, size_t stride_px, uint32_t w, uint32_t h,
-                           const Window& window = {});
+                           const Layer2::Window& window = {});
 
 }  // namespace spk::android

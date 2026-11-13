@@ -318,7 +318,7 @@ Layer2::Frame Layer2::frame(uint32_t w, uint32_t h) const {
 
 void pack_rgba8_look(const Layer2& look, const uint16_t* src, size_t src_stride_px,
                      uint32_t w, uint32_t h, uint8_t* out, size_t out_stride,
-                     const OutputCancel& cancel, const Window& window) {
+                     const OutputCancel& cancel, const Layer2::Window& window) {
     cancel.check();
     const uint32_t fw = window.full_w ? window.full_w : w;
     const uint32_t fh = window.full_h ? window.full_h : h;
@@ -344,7 +344,7 @@ void pack_rgba8_look(const Layer2& look, const uint16_t* src, size_t src_stride_
 }
 
 void apply_rgba16_in_place(const Layer2& look, uint16_t* px, size_t stride_px, uint32_t w, uint32_t h,
-                           const Window& window) {
+                           const Layer2::Window& window) {
     const uint32_t fw = window.full_w ? window.full_w : w;
     const uint32_t fh = window.full_h ? window.full_h : h;
     const Layer2::Frame frame = look.frame(fw, fh);
