@@ -1105,9 +1105,12 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
      * 每块尺寸完全相同、贴到画面边缘，因此所有块走同一个像素尺寸，胶片
      * 里按微米定义的颗粒/晕影等效果尺寸也一致。
      *
-     * 只支持手机照片（JPEG/PNG/HEIC，8 位 SDR），且不含边框、片边、日期、
-     * 裁切/旋转、光晕、眩光、暗角、蒙版和灰尘：那些是整幅画布或跨块效果，
-     * 分块后会切开。RAW 需要原生裁切。输出 JPEG。
+     * 相纸边框（留白、输出比例、打孔条、参数条）在整幅拼接完成后套一次，
+     * 所以边框也是全分辨率，和预览用同一份 FrameSpec。
+     *
+     * 只支持手机照片（JPEG/PNG/HEIC，8 位 SDR），且不含片边、日期、裁切/
+     * 旋转、光晕、眩光、暗角、蒙版和灰尘：片边和日期由引擎按整幅画布绘制，
+     * 其余是跨块效果，分块后会切开。RAW 需要原生裁切。输出 JPEG。
      */
     suspend fun exportTiled(): String {
         val state = _ui.value
@@ -1118,7 +1121,6 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
         if (engineHandle == 0L) return "引擎还没准备好"
         val catalog = state.catalog
         val base = state.edit
-        if (!base.frame.isNone || base.borderId != "none") return "分块导出暂不支持边框，请先选「无边框」"
         if (base.filmEdge) return "分块导出暂不支持片边，请先关闭「片边」"
         if (base.dateImprint) return "分块导出暂不支持日期，请先关闭「日期」"
         if (base.quarterTurns != 0 || base.flipH || base.cropX != 0.0 || base.cropY != 0.0 ||
@@ -1149,6 +1151,19 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
             val w = source.width
             val h = source.height
             if (w < 256 || h < 256) return "照片太小，分块导出没有意义"
+
+            // 相纸边框在拼接后按整幅成图绘制。先按整幅打印尺寸算好成图大小，
+            // 超出画布预算就在这里说明，而不是等到 OOM。
+            val frame = base.frame
+            val frameLayout = if (frame.isNone) null else frame.layout(w, h)
+            if (frameLayout != null) {
+                val framedPixels = frameLayout.width.toLong() * frameLayout.height
+                if (framedPixels > TILED_FRAME_MAX_PIXELS) {
+                    val mp = framedPixels / 1_000_000.0
+                    return "边框会把成图扩到 %.1f MP，超过分块导出的画布上限 %.0f MP；请换更窄的边框或先关闭边框"
+                        .format(Locale.ROOT, mp, TILED_FRAME_MAX_PIXELS / 1_000_000.0)
+                }
+            }
 
             // 整幅测光：引擎的测光固定缩到 1600 px 长边，这里直接从整幅缩，
             // 得到整幅的 EV；分块不再各自测光。
@@ -1277,11 +1292,25 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
                 }
             }
 
+            // 拼接完成，源图不再需要：先放掉它，再按整幅成图绘制相纸边框，
+            // 峰值就只有「打印 + 成图」两张，和分块前的源图+画布一样。
+            full?.recycle()
+            full = null
+            val output = if (frame.isNone) {
+                canvasBmp
+            } else {
+                FrameSpec.render(canvasBmp, frame, Caption.of(state.exif, catalog.film(edit.film)?.label ?: ""))
+            }
+            if (output !== canvasBmp) {
+                canvasBmp.recycle()
+                canvasBitmap = output
+            }
+
             val name = "Spektralab-X_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.ROOT).format(Date()) + "_tiled.jpg"
             val dir = File(app.cacheDir, "export").apply { mkdirs() }
             val part = File(dir, "$name.part")
             val encoded = withContext(Dispatchers.IO) {
-                part.outputStream().use { canvasBmp.compress(Bitmap.CompressFormat.JPEG, 98, it) }
+                part.outputStream().use { output.compress(Bitmap.CompressFormat.JPEG, 98, it) }
             }
             if (!encoded) return "分块导出失败：JPEG 编码失败"
             try {
@@ -1293,7 +1322,12 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
             val text = buildString {
                 append("分块导出完成\n")
                 append("来源：${src.kind.uppercase(Locale.ROOT)} ${src.sourceWidth}×${src.sourceHeight}\n")
-                append("输出：$w×$h（%.1f MP）\n".format(Locale.ROOT, w.toDouble() * h / 1_000_000.0))
+                append("画面：$w×$h（%.1f MP）\n".format(Locale.ROOT, w.toDouble() * h / 1_000_000.0))
+                if (!frame.isNone) {
+                    val label = Borders.byId(frame.id)?.label ?: "自定义边框"
+                    append(("边框：$label · 成图 ${output.width}×${output.height}（%.1f MP）\n")
+                        .format(Locale.ROOT, output.width.toDouble() * output.height / 1_000_000.0))
+                }
                 append("分块：${cols}×${rows} · 每块 ${tileW}×$tileH · 重叠 $ov px\n")
                 if (edit.autoExposure) append("整幅测光：%+.2f EV（每块一致）\n".format(Locale.ROOT, solvedEv))
                 append("色彩：${if (state.wideGamut) "Display P3" else "sRGB"} · JPEG 98\n")
@@ -1959,6 +1993,8 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
         private const val SEAM_MARGIN = 128
         /** The band around a seam that the final stitched image would actually show. */
         private const val SEAM_BAND = 32
+        /** The cap on the framed card a tiled export may build, in pixels (384 MB at ARGB_8888). */
+        private const val TILED_FRAME_MAX_PIXELS = 96_000_000L
         /** The engine's preview tier, which the share size exports. */
         private const val SHARE_EDGE = 3400.0
 

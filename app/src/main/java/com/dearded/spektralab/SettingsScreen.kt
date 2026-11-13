@@ -313,7 +313,7 @@ fun SettingsScreen(ui: UiState, vm: EditorViewModel, onClose: () -> Unit) {
                 {
                     ActionRow(
                         if (tiledRunning) "正在分块导出…" else "分块全分辨率导出（实验）",
-                        "按设备上限分块，160 px 重叠拼回原尺寸；整幅只测光一次，每块沿用同一 EV；保存 JPEG 到相册。暂不支持边框/片边/日期/裁切旋转/光晕眩光、暗角蒙版灰尘和 RAW。",
+                        "按设备上限分块，160 px 重叠拼回原尺寸；整幅只测光一次，每块沿用同一 EV；相纸边框在拼接后按整幅绘制。暂不支持片边/日期/裁切旋转/光晕眩光、暗角蒙版灰尘和 RAW。",
                     ) {
                         if (!tiledRunning) {
                             tiledRunning = true
