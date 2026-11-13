@@ -70,6 +70,13 @@ data class UiState(
     val wideGamut: Boolean = true,
     /** Highlight recovery for phone photos without a gain map, in stops (0 = off). */
     val highlightStops: Float = 0f,
+    /**
+     * 全分辨率导出（分块）. Off (the default) keeps the normal queue render for
+     * 高质量导出; on runs the tiled window render to the source's own pixels.
+     */
+    val tiledExport: Boolean = false,
+    /** The last tiled export's summary (or error), shown in a dialog. */
+    val tiledResult: String? = null,
     val maxPixels: Long = 0,
     val deviceSummary: String = "",
     val engineSummary: String = "",
@@ -104,6 +111,7 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
     private val _ui = MutableStateFlow(UiState(workingEdge = prefs.getInt("working_edge", 4096),
         wideGamut = prefs.getBoolean("wide_gamut", true),
         highlightStops = prefs.getFloat("highlight_stops_v2", 0f),
+        tiledExport = prefs.getBoolean("tiled_export", false),
         defaultFilm = prefs.getString("default_film", "").orEmpty(),
         defaultPaper = prefs.getString("default_paper", "").orEmpty(),
         newPhotoMode = newPhotoMode(prefs)))
@@ -1068,15 +1076,23 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * 极致渲染: a JPEG at the source's own resolution (working edge 0; only the
-     * device's pixel cap applies), the whole-frame full tier, in the background
-     * queue. The queue steps it down on a lost GPU or a blank frame.
+     * 极致渲染/全分辨率导出: with [UiState.tiledExport] off, a JPEG at the
+     * source's own resolution (working edge 0; only the device's pixel cap
+     * applies), the whole-frame full tier, in the background queue; the queue
+     * steps it down on a lost GPU or a blank frame. With it on, the tiled
+     * window render ([runTiledExport]) to the source's own pixels instead.
      */
     fun exportExtreme() {
         clearOverride(render = true)
         val state = _ui.value
         val src = state.source ?: return
         val uri = lastUri ?: return
+        // 全分辨率导出（分块）打开时，这个动作走窗口渲染到原始像素。RAW 仍走
+        // 正常队列（工作尺寸），因为整幅 RAW 超过单缓冲上限。
+        if (state.tiledExport && src.kind != "raw") {
+            runTiledExport()
+            return
+        }
         val sw = src.sourceWidth.takeIf { it > 0 } ?: src.width
         val sh = src.sourceHeight.takeIf { it > 0 } ?: src.height
         val px = sw.toLong() * sh
@@ -1100,7 +1116,29 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * 分块全分辨率导出（实验）：把整幅照片切成带重叠的块，逐块冲洗后拼回
+     * 全分辨率导出（分块）的入口：设置打开后，保存菜单的「全分辨率导出」走这里。
+     * 整幅测光、逐块窗口渲染、拼接和边框都在 [exportTiled]；这里只负责把编辑器
+     * 置为导出中、把块进度放到遮罩上，结束后把摘要放进对话框。
+     */
+    private fun runTiledExport() {
+        if (_ui.value.exporting) return
+        _ui.update { it.copy(exporting = true, busy = "正在分块导出…", error = null) }
+        viewModelScope.launch {
+            val text = try {
+                exportTiled { progress -> _ui.update { it.copy(busy = progress) } }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                "分块导出失败：${e.message ?: e}"
+            } finally {
+                _ui.update { it.copy(exporting = false, busy = null) }
+            }
+            _ui.update { it.copy(tiledResult = text) }
+        }
+    }
+
+    /**
+     * 全分辨率导出（分块）：把整幅照片切成带重叠的块，逐块冲洗后拼回
      * 原尺寸。整幅只测光一次，每块用 [NativeEngine.solve] 的 EV 冻结自动
      * 曝光，避免每块各自测光在拼接处留下亮度台阶。
      *
@@ -1119,7 +1157,7 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
      * 给出画布尺寸和窗口原点，因此也是整幅坐标。RAW 需要引擎的原生分块解码
      * （整幅 RAW 超过 GPU 单缓冲上限），暂不支持。输出 JPEG。
      */
-    suspend fun exportTiled(): String {
+    suspend fun exportTiled(onProgress: (String) -> Unit = {}): String {
         val state = _ui.value
         val uri = lastUri ?: return "先在编辑器里打开一张照片"
         val src = state.source ?: return "照片还没打开完"
@@ -1146,6 +1184,7 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
         var layoutSession = 0L
         val started = SystemClock.elapsedRealtime()
         try {
+            onProgress("正在分块导出：读取照片…")
             // 整幅解码一次：分块从它裁剪，测光也从它缩小，两者来自同一像素源。
             val photo = withContext(Dispatchers.IO) { loader.decodePhoto(uri, 0, 0) }
             full = photo
@@ -1206,6 +1245,7 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
                 if (q.length() < 8) return "片边布局失败：片门位置不完整"
                 for (i in 0 until 8) gateQuad[i] = q.optDouble(i, 0.0)
                 log("tiled export: film edge $frameW×$frameH -> canvas $canvasW×$canvasH vertical=$vertical")
+                onProgress("正在分块导出：画布 $canvasW×$canvasH…")
                 withContext(NonCancellable + ExportThread.dispatcher) { NativeEngine.release(layoutSession) }
                 layoutSession = 0L
             }
@@ -1435,6 +1475,7 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
                     tile.recycle()
                     done++
                     log("tiled export: tile $done/${rows * cols} ${winW}x${winH}")
+                    onProgress("正在分块导出：$done/${rows * cols} 块")
                 } finally {
                     if (handle != 0L) withContext(NonCancellable + ExportThread.dispatcher) {
                         NativeEngine.release(handle)
@@ -1458,6 +1499,7 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
                 canvasBitmap = output
             }
 
+            onProgress("正在分块导出：写入 JPEG…")
             val name = "Spektralab-X_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.ROOT).format(Date()) + "_tiled.jpg"
             val dir = File(app.cacheDir, "export").apply { mkdirs() }
             val part = File(dir, "$name.part")
@@ -1580,6 +1622,17 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
     fun setWideGamut(on: Boolean) {
         prefs.edit().putBoolean("wide_gamut", on).apply()
         _ui.update { it.copy(wideGamut = on) }
+    }
+
+    /**
+     * 全分辨率导出（分块）. Off keeps 高质量导出 on the normal queue render (the
+     * device's pixel cap applies); on sends it to the tiled window render at
+     * the source's own pixels. Persisted, default off.
+     */
+    fun setTiledExport(on: Boolean) {
+        if (on == _ui.value.tiledExport) return
+        prefs.edit().putBoolean("tiled_export", on).apply()
+        _ui.update { it.copy(tiledExport = on) }
     }
 
     /** A phone photo is re-opened with the new recovery; the edit is kept. */
@@ -2150,6 +2203,7 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     fun consumeMessage() = _ui.update { it.copy(message = null) }
+    fun consumeTiledResult() = _ui.update { it.copy(tiledResult = null) }
     fun showMessage(text: String) = _ui.update { it.copy(message = text) }
     fun dismissError() = _ui.update { it.copy(error = null) }
 

@@ -145,8 +145,6 @@ fun SettingsScreen(ui: UiState, vm: EditorViewModel, onClose: () -> Unit) {
             var tileBenchRunning by remember { mutableStateOf(false) }
             var seamResult by remember { mutableStateOf<String?>(null) }
             var seamRunning by remember { mutableStateOf(false) }
-            var tiledResult by remember { mutableStateOf<String?>(null) }
-            var tiledRunning by remember { mutableStateOf(false) }
             SettingsGroup("编辑", buildList<@Composable () -> Unit> {
                 add {
                     SettingRow(
@@ -230,6 +228,16 @@ fun SettingsScreen(ui: UiState, vm: EditorViewModel, onClose: () -> Unit) {
                     }
                 },
                 {
+                    SettingRow(
+                        "全分辨率导出（分块）", ui.tiledExport, true,
+                        note = if (ui.tiledExport) {
+                            "保存菜单的「全分辨率导出」按块渲染到原始像素；只写 8 位 JPEG，RAW 仍走正常流程。"
+                        } else {
+                            "关闭时「高质量导出」走正常渲染，受设备像素上限限制；打开后改为分块渲染。"
+                        },
+                    ) { vm.setTiledExport(it) }
+                },
+                {
                     var on by remember { mutableStateOf(LocationSetting.enabled(context)) }
                     SettingRow("导出保留拍摄位置", on, true) {
                         on = it; LocationSetting.set(context, it)
@@ -310,24 +318,6 @@ fun SettingsScreen(ui: UiState, vm: EditorViewModel, onClose: () -> Unit) {
                         }
                     }
                 },
-                {
-                    ActionRow(
-                        if (tiledRunning) "正在分块导出…" else "分块全分辨率导出（实验）",
-                        "按设备上限分块，160 px 重叠拼回原尺寸；整幅只测光一次，每块沿用同一 EV；相纸边框在拼接后按整幅绘制。暂不支持片边/日期/裁切旋转/光晕眩光、暗角蒙版灰尘和 RAW。",
-                    ) {
-                        if (!tiledRunning) {
-                            tiledRunning = true
-                            tiledResult = null
-                            scope.launch {
-                                try {
-                                    tiledResult = vm.exportTiled()
-                                } finally {
-                                    tiledRunning = false
-                                }
-                            }
-                        }
-                    }
-                },
                 { Column(Modifier.padding(vertical = 12.dp)) { AboutSection() } },
             ))
             Spacer(Modifier.height(24.dp))
@@ -344,14 +334,6 @@ fun SettingsScreen(ui: UiState, vm: EditorViewModel, onClose: () -> Unit) {
                     onDismissRequest = { seamResult = null },
                     confirmButton = { TextButton(onClick = { seamResult = null }) { Text("好") } },
                     title = { Text("接缝测试") },
-                    text = { Text(result, style = MaterialTheme.typography.bodySmall) },
-                )
-            }
-            tiledResult?.let { result ->
-                AlertDialog(
-                    onDismissRequest = { tiledResult = null },
-                    confirmButton = { TextButton(onClick = { tiledResult = null }) { Text("好") } },
-                    title = { Text("分块导出") },
                     text = { Text(result, style = MaterialTheme.typography.bodySmall) },
                 )
             }

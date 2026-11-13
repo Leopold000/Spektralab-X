@@ -230,9 +230,12 @@ fun EditorScreen(vm: EditorViewModel, onLightTable: () -> Unit = {}) {
                                 exportMenu = false; exportWithNotice(ExportFormat.TIFF, ExportSize.FULL, TiffColorSpace.ADOBE_RGB)
                             })
                             if (HeifExport.available) DropdownMenuItem(text = { Text("HEIF · 工作尺寸（sRGB）") }, onClick = { exportMenu = false; exportWithNotice(ExportFormat.HEIF, ExportSize.FULL) })
-                            DropdownMenuItem(text = { Text("高质量导出（受设备上限限制）") }, onClick = {
-                                exportMenu = false; savedAt = System.currentTimeMillis(); vm.exportExtreme()
-                            })
+                            DropdownMenuItem(
+                                text = { Text(if (ui.tiledExport) "全分辨率导出（分块）" else "高质量导出（受设备上限限制）") },
+                                onClick = {
+                                    exportMenu = false; savedAt = System.currentTimeMillis(); vm.exportExtreme()
+                                },
+                            )
                         }
                     }
     }
@@ -302,6 +305,14 @@ fun EditorScreen(vm: EditorViewModel, onLightTable: () -> Unit = {}) {
                         confirmButton = { TextButton(onClick = { confirmReset = false; vm.resetAll() }) { Text("重置", color = Palette.Warning) } },
                         dismissButton = { TextButton(onClick = { confirmReset = false }) { Text("取消") } },
                     )
+                    ui.tiledResult?.let { result ->
+                        AlertDialog(
+                            onDismissRequest = { vm.consumeTiledResult() },
+                            title = { Text("全分辨率导出（分块）") },
+                            text = { Text(result, style = MaterialTheme.typography.bodySmall) },
+                            confirmButton = { TextButton(onClick = { vm.consumeTiledResult() }) { Text("好") } },
+                        )
+                    }
                     IconButton(onClick = vm::undo, enabled = canUndo) {
                         HistoryIcon(redo = false, tint = if (canUndo) Palette.OnSurface else Palette.OnSurfaceSoft.copy(alpha = 0.38f))
                     }
