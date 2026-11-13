@@ -1487,6 +1487,13 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
                     append(("片边画布：$canvasW×$canvasH（%.1f MP）· ${edit.edgeFormat}\n")
                         .format(Locale.ROOT, canvasW.toDouble() * canvasH / 1_000_000.0))
                 }
+                val effects = mutableListOf<String>()
+                if (edit.dateImprint) effects += "日期"
+                if (edit.grainActive && edit.grainAmount > 0.0) effects += "颗粒"
+                if (edit.halationActive) effects += "光晕"
+                if (edit.glareActive) effects += "眩光"
+                if (!look.neutral) effects += "调整层"
+                if (effects.isNotEmpty()) append("效果：${effects.joinToString("、")}\n")
                 if (!frame.isNone) {
                     val label = Borders.byId(frame.id)?.label ?: "自定义边框"
                     append(("边框：$label · 成图 ${output.width}×${output.height}（%.1f MP）\n")
