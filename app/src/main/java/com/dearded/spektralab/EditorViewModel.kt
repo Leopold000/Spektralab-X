@@ -1309,10 +1309,18 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
             val name = "Spektralab-X_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.ROOT).format(Date()) + "_tiled.jpg"
             val dir = File(app.cacheDir, "export").apply { mkdirs() }
             val part = File(dir, "$name.part")
-            val encoded = withContext(Dispatchers.IO) {
-                part.outputStream().use { output.compress(Bitmap.CompressFormat.JPEG, 98, it) }
-            }
-            if (!encoded) return "分块导出失败：JPEG 编码失败"
+            // 先走队列同款的 4:4:4 编码（无子采样，色度细节不软），ICC 取自
+            // 输出位图自己的色彩空间；编不了时退回 Bitmap.compress 的 4:2:0，
+            // 不让一次编码失败丢掉整张导出。
+            val codec = withContext(Dispatchers.IO) {
+                val icc = tiledIcc(output.colorSpace)
+                if (icc != null && NativeEngine.writeJpeg444(output, part.absolutePath, 98, icc)) {
+                    "4:4:4"
+                } else {
+                    part.delete()
+                    if (part.outputStream().use { output.compress(Bitmap.CompressFormat.JPEG, 98, it) }) "4:2:0" else null
+                }
+            } ?: return "分块导出失败：JPEG 编码失败"
             try {
                 withContext(Dispatchers.IO) { MediaSaver.saveFile(app, part, name, "image/jpeg") }
             } finally {
@@ -1330,7 +1338,7 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
                 }
                 append("分块：${cols}×${rows} · 每块 ${tileW}×$tileH · 重叠 $ov px\n")
                 if (edit.autoExposure) append("整幅测光：%+.2f EV（每块一致）\n".format(Locale.ROOT, solvedEv))
-                append("色彩：${if (state.wideGamut) "Display P3" else "sRGB"} · JPEG 98\n")
+                append("色彩：${if (state.wideGamut) "Display P3" else "sRGB"} · JPEG 98 · $codec\n")
                 append("用时：%.1f s\n".format(Locale.ROOT, ms / 1000.0))
                 append("已保存到相册：$name")
             }
@@ -1353,6 +1361,20 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
             canvasBitmap?.recycle()
         }
     }
+
+    /**
+     * The ICC profile Skia embeds for [space]: a 1x1 JPEG is encoded and its
+     * APP2 ICC_PROFILE chunks joined, the same way ProcessingQueue does for its
+     * 4:4:4 path, so a tiled 4:4:4 and a queue 4:4:4 carry identical bytes.
+     */
+    private fun tiledIcc(space: ColorSpace?): ByteArray? = runCatching {
+        val s = space ?: ColorSpace.get(ColorSpace.Named.SRGB)
+        val tiny = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888, false, s)
+        val jpeg = java.io.ByteArrayOutputStream()
+            .also { tiny.compress(Bitmap.CompressFormat.JPEG, 90, it) }.toByteArray()
+        tiny.recycle()
+        ProcessingQueue.Icc.iccFromJpeg(jpeg)
+    }.getOrNull()
 
     // --- settings ------------------------------------------------------------
 
