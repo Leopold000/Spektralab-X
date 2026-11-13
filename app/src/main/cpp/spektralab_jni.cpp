@@ -1318,6 +1318,27 @@ JNI_FN(jstring, getParams)(JNIEnv* env, jobject, jlong handle) {
     return nullptr;
 }
 
+// RFC-015's meter, exposed for a tiled export: `spk_solve("exposure")` returns
+// the one EV this frame's auto-exposure would apply, without rendering. A tiled
+// export meters the complete frame once and freezes that value on every tile
+// (auto_exposure off + exposure_baseline_ev), so no tile derives its own AE.
+JNI_FN(jstring, solve)(JNIEnv* env, jobject, jlong handle, jstring target_j) {
+    auto* s = reinterpret_cast<Session*>(handle);
+    if (!s) { fail("no session"); return nullptr; }
+    try {
+        char* reply = nullptr;
+        const spk_status st = spk_solve(s->session, str(env, target_j).c_str(), &reply);
+        std::unique_ptr<char, decltype(&spk_string_free)> owned(reply, &spk_string_free);
+        if (st != SPK_OK) { fail(engine_error("solve")); return nullptr; }
+        return jstr(env, reply ? reply : "{}");
+    } catch (const std::exception& e) {
+        fail(std::string("solve: ") + e.what());
+    } catch (...) {
+        fail("solve: unknown failure");
+    }
+    return nullptr;
+}
+
 // `r` into `reuse` when it is the same size, else into a new Bitmap.
 jobject pack_into(JNIEnv* env, const spk_result& r, jobject reuse, const spk::android::Layer2* look,
                   const spk::android::OutputTransform* xf, const float* rgb = nullptr,

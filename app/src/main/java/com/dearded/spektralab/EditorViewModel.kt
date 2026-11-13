@@ -3,8 +3,11 @@ package com.dearded.spektralab
 import android.app.Application
 import android.content.Intent
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.ColorSpace
 import android.graphics.ImageDecoder
+import android.graphics.Paint
+import android.graphics.Rect
 import android.net.Uri
 import android.os.SystemClock
 import android.provider.OpenableColumns
@@ -1092,6 +1095,229 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
         host.queue.enqueue(job)
         log("queued ${job.label} ${sw}x$sh")
         _ui.update { it.copy(message = "已加入“正在处理”：优先原始尺寸，受设备与内存上限限制；可继续编辑或切到后台") }
+    }
+
+    /**
+     * 分块全分辨率导出（实验）：把整幅照片切成带重叠的块，逐块冲洗后拼回
+     * 原尺寸。整幅只测光一次，每块用 [NativeEngine.solve] 的 EV 冻结自动
+     * 曝光，避免每块各自测光在拼接处留下亮度台阶。
+     *
+     * 每块尺寸完全相同、贴到画面边缘，因此所有块走同一个像素尺寸，胶片
+     * 里按微米定义的颗粒/晕影等效果尺寸也一致。
+     *
+     * 只支持手机照片（JPEG/PNG/HEIC，8 位 SDR），且不含边框、片边、日期、
+     * 裁切/旋转、光晕、眩光、暗角、蒙版和灰尘：那些是整幅画布或跨块效果，
+     * 分块后会切开。RAW 需要原生裁切。输出 JPEG。
+     */
+    suspend fun exportTiled(): String {
+        val state = _ui.value
+        val uri = lastUri ?: return "先在编辑器里打开一张照片"
+        val src = state.source ?: return "照片还没打开完"
+        if (src.kind == "raw") return "分块导出暂只支持 JPEG/PNG/HEIC；RAW 需要原生裁切，下一步再做"
+        val engineHandle = engine
+        if (engineHandle == 0L) return "引擎还没准备好"
+        val catalog = state.catalog
+        val base = state.edit
+        if (!base.frame.isNone || base.borderId != "none") return "分块导出暂不支持边框，请先选「无边框」"
+        if (base.filmEdge) return "分块导出暂不支持片边，请先关闭「片边」"
+        if (base.dateImprint) return "分块导出暂不支持日期，请先关闭「日期」"
+        if (base.quarterTurns != 0 || base.flipH || base.cropX != 0.0 || base.cropY != 0.0 ||
+            base.cropW != 1.0 || base.cropH != 1.0
+        ) return "分块导出暂不支持裁切和旋转，请先恢复整幅"
+        if (base.noFilm) return "分块导出暂不支持「无胶片」，请先选择胶片和相纸"
+        if (base.halationActive) return "分块导出暂不支持光晕，请先关闭「光晕」"
+        if (base.glareActive) return "分块导出暂不支持眩光，请先关闭「眩光」"
+        val look = base.look
+        if (look.vignette != 0.0 || look.masks.isNotEmpty() || look.dust.active)
+            return "分块导出暂不支持暗角、蒙版和灰尘，请先关闭"
+        val film = base.film.takeIf { it.isNotEmpty() && catalog.film(it) != null }
+            ?: return "请先在编辑器里选择胶片"
+        val edit = withFilm(base, catalog, film)?.let { catalog.normalize(it) } ?: return "胶片不可用：$film"
+
+        var full: Photo? = null
+        var canvasBitmap: Bitmap? = null
+        var meterSession = 0L
+        val started = SystemClock.elapsedRealtime()
+        try {
+            // 整幅解码一次：分块从它裁剪，测光也从它缩小，两者来自同一像素源。
+            val photo = withContext(Dispatchers.IO) { loader.decodePhoto(uri, 0, 0) }
+            full = photo
+            if (photo.hdr) return "分块导出暂不支持 HDR 照片"
+            if (photo.highPrecisionSdr) return "分块导出暂不支持 16 位 SDR 照片"
+            val source = photo.bitmap
+            if (source.config != Bitmap.Config.ARGB_8888) return "分块导出暂只支持 8 位照片"
+            val w = source.width
+            val h = source.height
+            if (w < 256 || h < 256) return "照片太小，分块导出没有意义"
+
+            // 整幅测光：引擎的测光固定缩到 1600 px 长边，这里直接从整幅缩，
+            // 得到整幅的 EV；分块不再各自测光。
+            val solvedEv = if (edit.autoExposure) {
+                val meterScale = min(1.0, 1600.0 / max(w, h))
+                val mw = max(1, (w * meterScale).roundToInt())
+                val mh = max(1, (h * meterScale).roundToInt())
+                val meterBmp = if (mw != w || mh != h) {
+                    Bitmap.createScaledBitmap(source, mw, mh, true)
+                } else {
+                    source.copy(Bitmap.Config.ARGB_8888, false) ?: return "无法复制测光图"
+                }
+                try {
+                    val opened = withContext(ExportThread.dispatcher) {
+                        openPhotoSession(
+                            engineHandle,
+                            Photo(meterBmp, photo.space, sourceWidth = mw, sourceHeight = mh),
+                            state.highlightStops,
+                        ) { space, linear ->
+                            Edit.openingParams(edit, inputSpace = space, linear = linear).toString()
+                        }
+                    }
+                    meterSession = opened.handle
+                    if (meterSession == 0L) return "整幅测光失败：${NativeEngine.lastError()}"
+                    val json = withContext(ExportThread.dispatcher) { NativeEngine.solve(meterSession, "exposure") }
+                    JSONObject(json ?: "{}").optJSONObject("solved_params")
+                        ?.optDouble("exposure_compensation_ev", 0.0) ?: 0.0
+                } finally {
+                    if (meterSession != 0L) withContext(NonCancellable + ExportThread.dispatcher) {
+                        NativeEngine.release(meterSession)
+                    }
+                    meterSession = 0L
+                    meterBmp.recycle()
+                }
+            } else 0.0
+
+            // 每块不超过设备的像素上限和长边；块外留一圈重叠，拼接时裁掉。
+            // 所有块都取 tileW×tileH 并贴边，边缘的块向左/向上多取，而不是
+            // 变窄变小——统一的块尺寸让胶片按微米算的效果保持同一比例。
+            val cap = state.maxPixels.takeIf { it > 0 } ?: 8_388_608L
+            val edge = (state.workingEdge.takeIf { it > 0 } ?: 3072).coerceIn(1024, 3072)
+            val tileW = min(w, edge)
+            val tileH = min(h, min(edge, (cap / tileW).toInt().coerceAtLeast(1)))
+            if (tileW < 256 || tileH < 256) return "可用内存太小，无法切块"
+            val ov = min(160, min(tileW, tileH) / 4)
+            val coreW = max(1, tileW - 2 * ov)
+            val coreH = max(1, tileH - 2 * ov)
+            val cols = (w + coreW - 1) / coreW
+            val rows = (h + coreH - 1) / coreH
+
+            val canvasSpace = if (state.wideGamut) {
+                ColorSpace.get(ColorSpace.Named.DISPLAY_P3)
+            } else {
+                ColorSpace.get(ColorSpace.Named.SRGB)
+            }
+            val canvasBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888, false, canvasSpace)
+            canvasBitmap = canvasBmp
+            val canvas = Canvas(canvasBmp)
+            val paint = Paint().apply { isFilterBitmap = false }
+            val target = if (state.wideGamut) "Display P3" else "sRGB"
+            var done = 0
+            for (row in 0 until rows) for (col in 0 until cols) {
+                val cx0 = col * coreW
+                val cy0 = row * coreH
+                val cx1 = min(w, cx0 + coreW)
+                val cy1 = min(h, cy0 + coreH)
+                if (cx0 >= cx1 || cy0 >= cy1) continue
+                val x0 = min(max(0, cx0 - ov), max(0, w - tileW))
+                val y0 = min(max(0, cy0 - ov), max(0, h - tileH))
+                val x1 = min(w, x0 + tileW)
+                val y1 = min(h, y0 + tileH)
+                var crop: Bitmap? = Bitmap.createBitmap(source, x0, y0, x1 - x0, y1 - y0)
+                if (crop === source) {
+                    crop = source.copy(Bitmap.Config.ARGB_8888, false)
+                        ?: return "分块导出失败：无法复制整幅分块"
+                }
+                var handle = 0L
+                try {
+                    val opened = withContext(ExportThread.dispatcher) {
+                        openPhotoSession(
+                            engineHandle,
+                            Photo(crop!!, photo.space, sourceWidth = x1 - x0, sourceHeight = y1 - y0),
+                            state.highlightStops,
+                        ) { space, linear ->
+                            val p = Edit.openingParams(edit, inputSpace = space, linear = linear)
+                            p.put("auto_exposure", false)
+                            if (edit.autoExposure) p.put("exposure_baseline_ev", solvedEv)
+                            p.toString()
+                        }
+                    }
+                    handle = opened.handle
+                    crop = null // openPhotoSession 已接管这块源图
+                    if (handle == 0L) return "分块导出失败：${NativeEngine.lastError()}"
+                    val tile = withContext(ExportThread.dispatcher) {
+                        if (!NativeEngine.setOutput(handle, target, true)) return@withContext null
+                        // 调整层是逐像素的（暗角/蒙版/灰尘已在上面排除），
+                        // 每块应用同一份，拼接后与整幅一致。
+                        if (!look.neutral) {
+                            UserLibrary.get(app).applyLut(handle, look, null)
+                            if (!NativeEngine.setLook(handle, look.values())) {
+                                return@withContext null
+                            }
+                        }
+                        NativeEngine.renderBitmap(handle, "full")
+                    } ?: return "分块导出失败：${NativeEngine.lastError()}"
+                    if (tile.width != x1 - x0 || tile.height != y1 - y0) {
+                        val got = "${tile.width}×${tile.height}"
+                        tile.recycle()
+                        return "分块导出失败：输出 $got 与分块 ${x1 - x0}×${y1 - y0} 不一致"
+                    }
+                    // 只把这块的核心区域放回去，重叠留在边缘。
+                    canvas.drawBitmap(
+                        tile,
+                        Rect(cx0 - x0, cy0 - y0, cx1 - x0, cy1 - y0),
+                        Rect(cx0, cy0, cx1, cy1),
+                        paint,
+                    )
+                    tile.recycle()
+                    done++
+                    log("tiled export: tile $done/${rows * cols} ${x1 - x0}x${y1 - y0}")
+                } finally {
+                    if (handle != 0L) withContext(NonCancellable + ExportThread.dispatcher) {
+                        NativeEngine.release(handle)
+                    }
+                    crop?.recycle()
+                }
+            }
+
+            val name = "Spektralab-X_" + SimpleDateFormat("yyyyMMdd_HHmmss", Locale.ROOT).format(Date()) + "_tiled.jpg"
+            val dir = File(app.cacheDir, "export").apply { mkdirs() }
+            val part = File(dir, "$name.part")
+            val encoded = withContext(Dispatchers.IO) {
+                part.outputStream().use { canvasBmp.compress(Bitmap.CompressFormat.JPEG, 98, it) }
+            }
+            if (!encoded) return "分块导出失败：JPEG 编码失败"
+            try {
+                withContext(Dispatchers.IO) { MediaSaver.saveFile(app, part, name, "image/jpeg") }
+            } finally {
+                withContext(Dispatchers.IO) { part.delete() }
+            }
+            val ms = SystemClock.elapsedRealtime() - started
+            val text = buildString {
+                append("分块导出完成\n")
+                append("来源：${src.kind.uppercase(Locale.ROOT)} ${src.sourceWidth}×${src.sourceHeight}\n")
+                append("输出：$w×$h（%.1f MP）\n".format(Locale.ROOT, w.toDouble() * h / 1_000_000.0))
+                append("分块：${cols}×${rows} · 每块 ${tileW}×$tileH · 重叠 $ov px\n")
+                if (edit.autoExposure) append("整幅测光：%+.2f EV（每块一致）\n".format(Locale.ROOT, solvedEv))
+                append("色彩：${if (state.wideGamut) "Display P3" else "sRGB"} · JPEG 98\n")
+                append("用时：%.1f s\n".format(Locale.ROOT, ms / 1000.0))
+                append("已保存到相册：$name")
+            }
+            log("tiled export: $text")
+            return text
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: OutOfMemoryError) {
+            return "分块导出失败：内存不足，整幅源图和输出图放不下"
+        } catch (e: Throwable) {
+            return "分块导出失败：${e.message ?: e}"
+        } finally {
+            if (meterSession != 0L) {
+                try {
+                    withContext(NonCancellable + ExportThread.dispatcher) { NativeEngine.release(meterSession) }
+                } catch (_: Throwable) {
+                }
+            }
+            full?.recycle()
+            canvasBitmap?.recycle()
+        }
     }
 
     // --- settings ------------------------------------------------------------

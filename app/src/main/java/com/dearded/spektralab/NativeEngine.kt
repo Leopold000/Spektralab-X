@@ -93,6 +93,14 @@ object NativeEngine {
     external fun setParams(session: Long, deltaJson: String): String?
     external fun getParams(session: Long): String?
 
+    /**
+     * RFC-015's meter: `target` "exposure" returns
+     * `{"solved_params":{"exposure_compensation_ev":…},"exposure_ev_by_method":{…}}`
+     * for the whole frame, without rendering. A tiled export meters the complete
+     * frame once and freezes that EV on every tile. Null with lastError on failure.
+     */
+    external fun solve(session: Long, target: String): String?
+
     /** Tier is "live", "preview" or "full". */
     external fun renderBitmap(session: Long, tier: String): Bitmap?
 
