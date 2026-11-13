@@ -1110,43 +1110,35 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
      * 相纸边框（留白、输出比例、打孔条、参数条）在整幅拼接完成后套一次，
      * 所以边框也是全分辨率，和预览用同一份 FrameSpec。
      *
-     * 片边（135）走引擎的窗口渲染：布局按整幅画布生成，每次只派发画布上的
-     * 一块窗口，因此齿孔间距、片基和边缘字跨块一致。片边画布比画面大，块
-     * 按画布切，源图按引擎给的片门四角反算。
+     * 每块都是整幅的一个窗口（引擎的 spk_set_render_window）：pitch、片边布局、
+     * 日期、颗粒和眩光场的随机索引都按整幅算，所以块与块天然对齐。片边画布
+     * 比画面大，块按画布切，源图按引擎给的片门四角反算；HDR 的增益图按同一
+     * 归一化矩形切，16 位 SDR 直接走 F16 输入。
      *
-     * 只支持手机照片（JPEG/PNG/HEIC，8 位 SDR），且不含日期、旋转/翻转、
-     * 光晕、眩光、暗角、蒙版和灰尘；片边时还要求关闭颗粒。其余是跨块效果，
-     * 分块后会切开。RAW 需要原生裁切。输出 JPEG。
+     * 调整层（暗角/蒙版/灰尘）仍由 App 在每块打包时应用，但用 setLookWindow
+     * 给出画布尺寸和窗口原点，因此也是整幅坐标。RAW 需要引擎的原生分块解码
+     * （整幅 RAW 超过 GPU 单缓冲上限），暂不支持。输出 JPEG。
      */
     suspend fun exportTiled(): String {
         val state = _ui.value
         val uri = lastUri ?: return "先在编辑器里打开一张照片"
         val src = state.source ?: return "照片还没打开完"
-        if (src.kind == "raw") return "分块导出暂只支持 JPEG/PNG/HEIC；RAW 需要原生裁切，下一步再做"
+        if (src.kind == "raw") return "RAW 分块导出还需要引擎的原生分块解码（整幅 RAW 超过 GPU 单缓冲上限）；请先用整幅导出或「极致渲染」"
         val engineHandle = engine
         if (engineHandle == 0L) return "引擎还没准备好"
         val catalog = state.catalog
         val base = state.edit
-        if (base.dateImprint) return "分块导出暂不支持日期，请先关闭「日期」"
         if (base.quarterTurns != 0 || base.flipH) return "分块导出暂不支持旋转和翻转，请先恢复整幅"
         // 片边会把画面裁到片门（withFilmEdge），所以只有片边时允许非整幅裁切；
         // 那块裁切由 App 从整幅源图切出来，tile 参数里的 geometry crop 是 identity。
         if (!base.filmEdge && (base.cropX != 0.0 || base.cropY != 0.0 || base.cropW != 1.0 || base.cropH != 1.0))
             return "分块导出暂不支持裁切，请先恢复整幅"
         if (base.noFilm) return "分块导出暂不支持「无胶片」，请先选择胶片和相纸"
-        if (base.halationActive) return "分块导出暂不支持光晕，请先关闭「光晕」"
-        if (base.glareActive) return "分块导出暂不支持眩光，请先关闭「眩光」"
         val look = base.look
-        if (look.vignette != 0.0 || look.masks.isNotEmpty() || look.dust.active)
-            return "分块导出暂不支持暗角、蒙版和灰尘，请先关闭"
         val film = base.film.takeIf { it.isNotEmpty() && catalog.film(it) != null }
             ?: return "请先在编辑器里选择胶片"
         val edit = withFilm(base, catalog, film)?.let { catalog.normalize(it) } ?: return "胶片不可用：$film"
         val edgeOn = edit.filmEdge
-        // 颗粒按每块的局部像素和每个 session 的种子生成，窗口之间接不上；
-        // 片边这一版先要求关闭。光晕/眩光在上面已经一律拒绝。
-        if (edgeOn && edit.grainActive && edit.grainAmount != 0.0)
-            return "分块导出片边暂不支持颗粒，请先在「胶片效果」里关闭颗粒"
 
         var full: Photo? = null
         var canvasBitmap: Bitmap? = null
@@ -1157,13 +1149,16 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
             // 整幅解码一次：分块从它裁剪，测光也从它缩小，两者来自同一像素源。
             val photo = withContext(Dispatchers.IO) { loader.decodePhoto(uri, 0, 0) }
             full = photo
-            if (photo.hdr) return "分块导出暂不支持 HDR 照片"
-            if (photo.highPrecisionSdr) return "分块导出暂不支持 16 位 SDR 照片"
             val source = photo.bitmap
-            if (source.config != Bitmap.Config.ARGB_8888) return "分块导出暂只支持 8 位照片"
+            if (source.config != Bitmap.Config.ARGB_8888 && source.config != Bitmap.Config.RGBA_F16)
+                return "分块导出暂只支持 8 位或 16 位 SDR 照片"
             val w = source.width
             val h = source.height
             if (w < 256 || h < 256) return "照片太小，分块导出没有意义"
+            // HDR（Ultra HDR 增益图）：引擎按归一化位置采样增益图，所以切块时
+            // 增益图也要按同一归一化矩形切。原图留给最后的 full.recycle()。
+            val gainMap = photo.gain
+            val gainMeta = photo.gainMeta
 
             // 片边时引擎的「整幅画面」是裁到片门后的那一块；片门矩形只在这里
             // 算一次，布局、切块和片边画布都用它。tile session 的 geometry crop
@@ -1239,11 +1234,20 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
                 } else {
                     source.copy(Bitmap.Config.ARGB_8888, false) ?: return "无法复制测光图"
                 }
+                // HDR: the gain map is sampled by normalised position, so the
+                // whole gain map goes with the scaled base. It is copied
+                // because openPhotoSession recycles everything its Photo owns.
+                var meterGain: Bitmap? = null
+                if (gainMap != null && gainMeta != null && state.highlightStops > 0f) {
+                    meterGain = gainMap.copy(gainMap.config ?: Bitmap.Config.ARGB_8888, false)
+                        ?: return "无法复制 HDR 增益图"
+                }
                 try {
                     val opened = withContext(ExportThread.dispatcher) {
                         openPhotoSession(
                             engineHandle,
-                            Photo(meterBmp, photo.space, sourceWidth = mw, sourceHeight = mh),
+                            Photo(meterBmp, photo.space, gain = meterGain, gainMeta = gainMeta,
+                                sourceWidth = mw, sourceHeight = mh),
                             state.highlightStops,
                         ) { space, linear ->
                             Edit.openingParams(edit, inputSpace = space, linear = linear).toString()
@@ -1260,6 +1264,7 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
                     }
                     meterSession = 0L
                     meterBmp.recycle()
+                    meterGain?.recycle()
                 }
             } else 0.0
 
@@ -1272,7 +1277,10 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
             val tileW = min(canvasW, workingEdge)
             val tileH = min(canvasH, min(workingEdge, (cap / tileW).toInt().coerceAtLeast(1)))
             if (tileW < 256 || tileH < 256) return "可用内存太小，无法切块"
-            val ov = min(160, min(tileW, tileH) / 4)
+            // 光晕最宽的高斯（3σ）在最大强度下约 154 px，块边留 192 px 才能让
+            // 核心区读到完整的邻域；其余效果的重叠 160 px 已够。
+            val ov = min(if (edit.halationActive && edit.halationAmount > 0.0) 192 else 160,
+                min(tileW, tileH) / 4)
             val coreW = max(1, tileW - 2 * ov)
             val coreH = max(1, tileH - 2 * ov)
             val cols = (canvasW + coreW - 1) / coreW
@@ -1343,17 +1351,40 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
                     sw = (ceil(maxFx) + 2.0).toInt().coerceIn(sx + 1, frameW) - sx
                     sh = (ceil(maxFy) + 2.0).toInt().coerceIn(sy + 1, frameH) - sy
                 }
-                var crop: Bitmap? = Bitmap.createBitmap(source, gateX + sx, gateY + sy, sw, sh)
+                val srcX = gateX + sx
+                val srcY = gateY + sy
+                var crop: Bitmap? = Bitmap.createBitmap(source, srcX, srcY, sw, sh)
                 if (crop === source) {
-                    crop = source.copy(Bitmap.Config.ARGB_8888, false)
+                    crop = source.copy(source.config ?: Bitmap.Config.ARGB_8888, false)
                         ?: return "分块导出失败：无法复制整幅分块"
+                }
+                // HDR: the same normalised rectangle of the gain map (the engine
+                // samples it by normalised position, so a crop must follow the
+                // base crop). Copied, because the session recycles its bitmaps.
+                var gainCrop: Bitmap? = null
+                if (gainMap != null && gainMeta != null) {
+                    val gw = gainMap.width
+                    val gh = gainMap.height
+                    val gx0 = (srcX.toDouble() * gw / w).roundToInt().coerceIn(0, gw - 1)
+                    val gy0 = (srcY.toDouble() * gh / h).roundToInt().coerceIn(0, gh - 1)
+                    val gx1 = ((srcX + sw).toDouble() * gw / w).roundToInt().coerceIn(gx0 + 1, gw)
+                    val gy1 = ((srcY + sh).toDouble() * gh / h).roundToInt().coerceIn(gy0 + 1, gh)
+                    val part: Bitmap = if (gx0 == 0 && gy0 == 0 && gx1 == gw && gy1 == gh) {
+                        gainMap
+                    } else {
+                        Bitmap.createBitmap(gainMap, gx0, gy0, gx1 - gx0, gy1 - gy0)
+                    }
+                    val copy = part.copy(gainMap.config ?: Bitmap.Config.ARGB_8888, false)
+                    if (part !== gainMap && part !== copy) part.recycle()
+                    gainCrop = copy ?: return "分块导出失败：无法复制 HDR 增益图"
                 }
                 var handle = 0L
                 try {
                     val opened = withContext(ExportThread.dispatcher) {
                         openPhotoSession(
                             engineHandle,
-                            Photo(crop!!, photo.space, sourceWidth = sw, sourceHeight = sh),
+                            Photo(crop!!, photo.space, gain = gainCrop, gainMeta = gainMeta,
+                                sourceWidth = sw, sourceHeight = sh),
                             state.highlightStops,
                         ) { space, linear ->
                             val p = Edit.openingParams(tileEdit, inputSpace = space, linear = linear)
@@ -1364,18 +1395,23 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
                     }
                     handle = opened.handle
                     crop = null // openPhotoSession 已接管这块源图
+                    gainCrop = null
                     if (handle == 0L) return "分块导出失败：${NativeEngine.lastError()}"
                     val tile = withContext(ExportThread.dispatcher) {
-                        // 片边：告诉引擎这块画布窗口在整幅画布上的位置，以及
-                        // 这块源图在整幅画面上的位置。布局仍是整幅的，所以齿孔
-                        // 间距、片基颜色和边缘字跨块一致。
-                        val windowed = !edgeOn || NativeEngine.setRenderWindow(
+                        // 每块都是整幅画面的一个窗口：布局、pitch、齿孔/边缘字、
+                        // 日期和颗粒的随机索引都按整幅算，只派发这一块。
+                        val windowed = NativeEngine.setRenderWindow(
                             handle, frameW, frameH, winX, winY, winW, winH, sx, sy, sw, sh,
                         )
                         if (!windowed) return@withContext null
+                        // 调整层（暗角/蒙版/灰尘）按**成图画布**归一化，不是按块；
+                        // 片边时画布比画面大，所以这里单独告诉它画布和窗口原点。
+                        if (!NativeEngine.setLookWindow(handle, canvasW, canvasH, winX, winY)) {
+                            return@withContext null
+                        }
                         if (!NativeEngine.setOutput(handle, target, true)) return@withContext null
-                        // 调整层是逐像素的（暗角/蒙版/灰尘已在上面排除），
-                        // 每块应用同一份，拼接后与整幅一致。
+                        // 调整层是逐像素的，每块应用同一份；全局坐标由
+                        // setLookWindow 给出，拼接后与整幅一致。
                         if (!look.neutral) {
                             UserLibrary.get(app).applyLut(handle, look, null)
                             if (!NativeEngine.setLook(handle, look.values())) {
@@ -1404,6 +1440,7 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
                         NativeEngine.release(handle)
                     }
                     crop?.recycle()
+                    gainCrop?.recycle()
                 }
             }
 

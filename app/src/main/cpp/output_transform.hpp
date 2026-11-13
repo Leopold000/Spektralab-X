@@ -68,7 +68,7 @@ private:
 // Engine RGBA16 (encoded ProPhoto) -> Layer 2 (optional) -> `xf` -> RGBA8.
 void pack_rgba8(const uint16_t* src, size_t src_stride_px, uint32_t w, uint32_t h,
                 uint8_t* out, size_t out_stride, const Layer2* look, const OutputTransform& xf,
-                const OutputCancel& cancel = {});
+                const OutputCancel& cancel = {}, const Layer2::Window& window = {});
 // The same into RGBA16 with a row stride of `w` pixels (TIFF).
 void pack_rgba16(const uint16_t* src, size_t src_stride_px, uint32_t w, uint32_t h,
                  std::vector<uint16_t>& out, const Layer2* look, const OutputTransform& xf,
@@ -77,7 +77,8 @@ void pack_rgba16(const uint16_t* src, size_t src_stride_px, uint32_t w, uint32_t
 // No-film encoded ProPhoto RGB: grade first, quantise once, then convert.
 void pack_float_rgba8(const float* src, size_t src_stride_px, uint32_t w, uint32_t h,
                       uint8_t* out, size_t out_stride, const Layer2* look, const OutputTransform& xf,
-                      const OutputCancel& cancel = {}, const RawDevelopment* development = nullptr);
+                      const OutputCancel& cancel = {}, const RawDevelopment* development = nullptr,
+                      const Layer2::Window& window = {});
 void pack_float_rgba16(const float* src, size_t src_stride_px, uint32_t w, uint32_t h,
                        std::vector<uint16_t>& out, const Layer2* look, const OutputTransform& xf,
                        const OutputCancel& cancel = {}, const RawDevelopment* development = nullptr);

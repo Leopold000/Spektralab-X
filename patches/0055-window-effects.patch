@@ -1,0 +1,302 @@
+Make the whole-frame effects agree across a tiled window.
+Co-created with DeepSeek, 2026-11-13. See NOTICE for project terms.
+
+0054 gave the film canvas a window. This makes the effects that were still
+whole-frame-only work in that window:
+
+* The date back. Its group is already placed in whole-frame millimetres; the
+  window clips it and offsets the mask. The date on a bare frame (no film
+  edge) gets the same treatment through an identity layout over the full
+  frame, so a tiled export can carry a date with or without the edge.
+
+* Grain and the glare/micro-structure fields. Their values are drawn from a
+  per-pixel RNG; the draw is now indexed by the *whole frame's* pixel (first
+  pixel, row stride delta and window width travel in the kernel meta), so a
+  window is a crop of the one realisation. All-zero on the whole-frame path,
+  which is therefore bit-identical.
+
+* The window itself no longer requires the film edge: with grain, glare or a
+  date it is what keeps their coordinates global, and set_source_shape still
+  takes the pitch from the full frame.
+
+The film-edge date no longer refuses a windowed render. Halation has a wide
+3-sigma at its maximum strength, so the host's overlap grows to 192 px when it
+is on; the engine needs no new radius plumbing for that.
+diff --git a/engine/include/spektrafilm/spk_engine.h b/engine/include/spektrafilm/spk_engine.h
+index 3d366cc..00efe45 100644
+--- a/engine/include/spektrafilm/spk_engine.h
++++ b/engine/include/spektrafilm/spk_engine.h
+@@ -257,8 +257,13 @@ spk_status spk_overscan_geometry(spk_session* session, char** out_json);
+  * Every tile of one export must use the same full size, seeds and window
+  * origin arithmetic; the canvases then line up pixel for pixel. The output of
+  * `spk_render("full")` is `win_w` x `win_h`. Pass win_w or win_h zero to clear
+- * the window (the shipping whole-frame path, byte for byte). Only valid with
+- * the film edge on. Call after `spk_open` and before the first render. */
++ * the window (the shipping whole-frame path, byte for byte). Call after
++ * `spk_open` and before the first render.
++ *
++ * The window is also what makes whole-frame per-pixel effects agree across
++ * tiles: the pitch comes from the full frame, the date is clipped to the
++ * window, and grain and the glare field seed from the full frame's pixel
++ * index. */
+ spk_status spk_set_render_window(spk_session* session,
+                                  uint32_t full_w, uint32_t full_h,
+                                  uint32_t win_x, uint32_t win_y, uint32_t win_w, uint32_t win_h,
+diff --git a/engine/src/pipeline/engine.cpp b/engine/src/pipeline/engine.cpp
+index 730600e..adbc28b 100644
+--- a/engine/src/pipeline/engine.cpp
++++ b/engine/src/pipeline/engine.cpp
+@@ -2774,10 +2774,8 @@ spk_status spk_set_render_window(spk_session* session,
+     g_error.clear();
+     Pipeline::RenderWindow window;
+     if (win_w != 0 && win_h != 0) {
+-        if (!session->params.film_render.overscan.active) {
+-            g_error = "render window: the film edge is off";
+-            return SPK_ERR_USER;
+-        }
++        // Patch 0055: a window is also what makes the date, grain and glare
++        // agree across tiles, so it no longer requires the film edge.
+         if (full_w == 0 || full_h == 0 || src_w == 0 || src_h == 0) {
+             g_error = "render window: the full frame and the source rectangle must be non-empty";
+             return SPK_ERR_INVALID_ARG;
+diff --git a/engine/src/pipeline/overscan.cpp b/engine/src/pipeline/overscan.cpp
+index 16a441b..3072df8 100644
+--- a/engine/src/pipeline/overscan.cpp
++++ b/engine/src/pipeline/overscan.cpp
+@@ -2324,10 +2324,8 @@ bool Pipeline::node_overscan(const Image& in, Image& out, std::string& error) {
+             return false;
+         }
+     }
+-    if (render_window_.active && di.active) {
+-        error = "date_imprint: not supported in a windowed render yet";
+-        return false;
+-    }
++    // Patch 0055: the date is a group like the edge print, clipped to the
++    // window and offset back into it, so a windowed render draws it too.
+     const bool date_only = !overscan_wanted() && di.active;
+     if (!overscan_wanted() && !date_only) { out = in; return true; }
+     Timer t(this, "filming.expose.overscan");
+@@ -2358,12 +2356,21 @@ bool Pipeline::node_overscan(const Image& in, Image& out, std::string& error) {
+                             canvas.pixels(), error)) return false;
+     } else {
+         // The date alone, on the frame: an identity layout over the frame.
++        // Patch 0055: under a window the layout is still the whole frame's;
++        // only the canvas this run fills (and the source it samples) moves.
+         overscan_ = OverscanLayout{};
+         OverscanLayout& L = overscan_;
+         L.px = pixel_size_um_ / 1000.0;
+-        L.canvas_w = in.w; L.canvas_h = in.h;
++        L.canvas_w = render_window_.active ? render_window_.full_w : in.w;
++        L.canvas_h = render_window_.active ? render_window_.full_h : in.h;
+         L.A[0] = 1; L.A[1] = 0; L.A[2] = 0; L.A[3] = 1;
+         L.cu = 0; L.cv = 0; L.cs = 0; L.ct = 0;
++        if (render_window_.active) {
++            L.win_x = render_window_.win_x; L.win_y = render_window_.win_y;
++            L.win_w = render_window_.win_w; L.win_h = render_window_.win_h;
++            L.src_x = render_window_.src_x; L.src_y = render_window_.src_y;
++            L.src_w = render_window_.src_w; L.src_h = render_window_.src_h;
++        }
+         {
+             const double rear[3] = {1.0, 1.0, 0.0};
+             light_weights(*colour_, *blob_, film_sensitivity_edge_, params_.film.info.reference_illuminant,
+diff --git a/engine/src/pipeline/pipeline.cpp b/engine/src/pipeline/pipeline.cpp
+index 6a0982e..33cb2b9 100644
+--- a/engine/src/pipeline/pipeline.cpp
++++ b/engine/src/pipeline/pipeline.cpp
+@@ -584,6 +584,21 @@ bool Pipeline::spectral(const Image& cmy, const gpu::BufferRef& chd, const gpu::
+                           cmy.pixels(), error);
+ }
+ 
++void Pipeline::rng_window(uint32_t window_w, uint32_t& full_w, uint32_t& offset,
++                          uint32_t& stride) const {
++    if (!render_window_.active || render_window_.win_w == 0) {
++        full_w = window_w; offset = 0; stride = 0;
++        return;
++    }
++    // The field lives on the film canvas with the edge on, and on the frame
++    // without it. Either way it is the whole plane this window is a crop of.
++    full_w = overscan_wanted() && overscan_.valid && overscan_.canvas_w
++           ? overscan_.canvas_w : render_window_.full_w;
++    if (full_w < window_w) full_w = window_w;
++    offset = render_window_.win_y * full_w + render_window_.win_x;
++    stride = full_w - window_w;
++}
++
+ bool Pipeline::lognormal_field(uint32_t h, uint32_t w, double mean, double std, uint32_t seed,
+                                uint32_t stream0, bool per_channel, Image& out, std::string& error) {
+     out.h = h; out.w = w; out.c = 3;
+@@ -592,9 +607,12 @@ bool Pipeline::lognormal_field(uint32_t h, uint32_t w, double mean, double std,
+     const float p[2] = {float(mean), float(std)};
+     gpu::BufferRef p_buf = gpu_->upload(p, sizeof p, error);
+     if (!p_buf) return false;
+-    const uint32_t meta[4] = {uint32_t(out.pixels()), seed, stream0, per_channel ? 1u : 0u};
++    uint32_t full_w = w, offset = 0, stride = 0;
++    rng_window(w, full_w, offset, stride);
++    const uint32_t meta[7] = {uint32_t(out.pixels()), seed, stream0, per_channel ? 1u : 0u,
++                              offset, stride, w};
+     return gpu_->dispatch("spk_lognormal_field",
+-                          {gpu::Arg::buf(p_buf), gpu::Arg::inline_bytes(meta, 4), gpu::Arg::buf(out.buf)},
++                          {gpu::Arg::buf(p_buf), gpu::Arg::inline_bytes(meta, 7), gpu::Arg::buf(out.buf)},
+                           out.pixels(), error);
+ }
+ 
+@@ -1440,6 +1458,11 @@ bool Pipeline::grain_realise(const Image& in, Image& out, std::string& error) {
+     // The run's seed, hoisted to `film_prefix`: one realisation per render, so
+     // every strip of a striped run comes from the same grain field.
+     const uint32_t seed = film_seed_;
++    // Patch 0055: the grain's random draw is indexed by the whole frame's
++    // pixel, not the window's. A windowed render then gets a crop of the one
++    // realisation, so a tiled export has no seam in the grain.
++    uint32_t rng_full_w = in.w, rng_off = 0, rng_stride = 0;
++    rng_window(in.w, rng_full_w, rng_off, rng_stride);
+     Image grain;
+ 
+     if (g.sublayers_active) {
+@@ -1482,8 +1505,9 @@ bool Pipeline::grain_realise(const Image& in, Image& out, std::string& error) {
+ 
+         if (!dye_clouds) {
+             if (!alloc_like(in, grain, error)) return false;
+-            const uint32_t meta[4] = {uint32_t(k), uint32_t(in.pixels()),
+-                                      params_.film.info.is_positive() ? 1u : 0u, seed};
++            const uint32_t meta[7] = {uint32_t(k), uint32_t(in.pixels()),
++                                      params_.film.info.is_positive() ? 1u : 0u, seed,
++                                      rng_off, rng_stride, uint32_t(in.w)};
+             if (!gpu_->dispatch("spk_grain_layers",
+                                 {gpu::Arg::buf(in.buf), gpu::Arg::buf(baked_.grain_xa),
+                                  gpu::Arg::buf(baked_.grain_inv), gpu::Arg::buf(baked_.grain_ylay),
+@@ -1501,8 +1525,9 @@ bool Pipeline::grain_realise(const Image& in, Image& out, std::string& error) {
+             for (uint32_t sl = 0; sl < 3; ++sl) {
+                 Image layer;
+                 if (!alloc_like(in, layer, error)) return false;
+-                const uint32_t meta[5] = {uint32_t(k), uint32_t(in.pixels()),
+-                                          params_.film.info.is_positive() ? 1u : 0u, seed, sl};
++                const uint32_t meta[8] = {uint32_t(k), uint32_t(in.pixels()),
++                                          params_.film.info.is_positive() ? 1u : 0u, seed, sl,
++                                          rng_off, rng_stride, uint32_t(in.w)};
+                 if (!gpu_->dispatch("spk_grain_layer_one",
+                                     {gpu::Arg::buf(in.buf), gpu::Arg::buf(baked_.grain_xa),
+                                      gpu::Arg::buf(baked_.grain_inv), gpu::Arg::buf(baked_.grain_ylay),
+@@ -1539,10 +1564,11 @@ bool Pipeline::grain_realise(const Image& in, Image& out, std::string& error) {
+         gpu::BufferRef streams_buf = gpu_->upload_u32(streams, 3, error);
+         if (!lp_buf || !streams_buf) return false;
+         if (!alloc_like(in, grain, error)) return false;
+-        const uint32_t meta[3] = {uint32_t(in.pixels()), uint32_t(nsub), seed};
++        const uint32_t meta[6] = {uint32_t(in.pixels()), uint32_t(nsub), seed,
++                                  rng_off, rng_stride, uint32_t(in.w)};
+         if (!gpu_->dispatch("spk_grain_simple",
+                             {gpu::Arg::buf(in.buf), gpu::Arg::buf(lp_buf), gpu::Arg::buf(streams_buf),
+-                             gpu::Arg::inline_bytes(meta, 3), gpu::Arg::buf(grain.buf)},
++                             gpu::Arg::inline_bytes(meta, 6), gpu::Arg::buf(grain.buf)},
+                             in.pixels(), error)) return false;
+         double s[3], t0[3];
+         fill3(s, 1.0 / double(nsub));
+diff --git a/engine/src/pipeline/pipeline.hpp b/engine/src/pipeline/pipeline.hpp
+index cde31bd..58a672f 100644
+--- a/engine/src/pipeline/pipeline.hpp
++++ b/engine/src/pipeline/pipeline.hpp
+@@ -346,6 +346,12 @@ public:
+     void set_render_window(const RenderWindow& window) { render_window_ = window; }
+     void clear_render_window() { render_window_ = RenderWindow{}; }
+     const RenderWindow& render_window() const { return render_window_; }
++    // The random field's whole-frame width, this window's first pixel in it,
++    // and the row stride difference. Every per-pixel field (grain, glare,
++    // micro-structure) seeds from the *whole frame's* pixel index, so its
++    // realisation is a crop of the whole-frame one and windows line up.
++    // `window_w` is the field's own width (the window's, or the frame's).
++    void rng_window(uint32_t window_w, uint32_t& full_w, uint32_t& offset, uint32_t& stride) const;
+     // The film's pixel pitch, from the frame this pipeline is about to render.
+     //
+     // It must be set before *any* run, not just before `run_film`, and that is
+diff --git a/engine/src/shaders/vulkan/spk_grain_layer_one.comp b/engine/src/shaders/vulkan/spk_grain_layer_one.comp
+index f7c75d5..d737b53 100644
+--- a/engine/src/shaders/vulkan/spk_grain_layer_one.comp
++++ b/engine/src/shaders/vulkan/spk_grain_layer_one.comp
+@@ -28,6 +28,9 @@ void main() {
+     uint i = spk_global_index();
+     uint K = meta[0], n = meta[1], positive = meta[2], seed = meta[3], sl = meta[4];
+     if (i >= n) return;
++    // Patch 0055: the whole frame's pixel seeds the draw (meta 5/6/7 = first
++    // pixel, row stride delta, window width); zero on the whole-frame path.
++    uint gi = i + meta[5] + (i / max(meta[7], 1u)) * meta[6];
+     for (uint ch = 0u; ch < 3u; ++ch) {
+         precise float v = cmy[3u * i + ch];
+         if (positive != 0u) v = -v;
+@@ -43,7 +46,7 @@ void main() {
+         else if (mode == 1) d = ylay[(K - 1u) * 9u + col];
+         else { float y0 = ylay[low * 9u + col], y1 = ylay[(low + 1u) * 9u + col]; d = y0 + t * (y1 - y0); }
+         d += lp[4u * col];
+-        Rng rng = rng_init(i, streams[col], seed);
++        Rng rng = rng_init(gi, streams[col], seed);
+         dst[3u * i + ch] = layer_draw(rng, d, lp[4u * col + 1u], lp[4u * col + 2u], lp[4u * col + 3u]);
+     }
+ }
+diff --git a/engine/src/shaders/vulkan/spk_grain_layers.comp b/engine/src/shaders/vulkan/spk_grain_layers.comp
+index e10bbba..c844174 100644
+--- a/engine/src/shaders/vulkan/spk_grain_layers.comp
++++ b/engine/src/shaders/vulkan/spk_grain_layers.comp
+@@ -28,6 +28,9 @@ void main() {
+     uint i = spk_global_index();
+     uint K = meta[0], n = meta[1], positive = meta[2], seed = meta[3];
+     if (i >= n) return;
++    // Patch 0055: the whole frame's pixel seeds the draw (meta 4/5/6 = first
++    // pixel, row stride delta, window width); zero on the whole-frame path.
++    uint gi = i + meta[4] + (i / max(meta[6], 1u)) * meta[5];
+     for (uint ch = 0u; ch < 3u; ++ch) {
+         precise float v = cmy[3u * i + ch];
+         if (positive != 0u) v = -v;
+@@ -45,7 +48,7 @@ void main() {
+             else if (mode == 1) d = ylay[(K - 1u) * 9u + col];
+             else { float y0 = ylay[low * 9u + col], y1 = ylay[(low + 1u) * 9u + col]; d = y0 + t * (y1 - y0); }
+             d += lp[4u * col];
+-            Rng rng = rng_init(i, streams[col], seed);
++            Rng rng = rng_init(gi, streams[col], seed);
+             acc += layer_draw(rng, d, lp[4u * col + 1u], lp[4u * col + 2u], lp[4u * col + 3u]);
+         }
+         dst[3u * i + ch] = acc;
+diff --git a/engine/src/shaders/vulkan/spk_grain_simple.comp b/engine/src/shaders/vulkan/spk_grain_simple.comp
+index 1d9c120..8d4a76b 100644
+--- a/engine/src/shaders/vulkan/spk_grain_simple.comp
++++ b/engine/src/shaders/vulkan/spk_grain_simple.comp
+@@ -20,11 +20,14 @@ void main() {
+     uint i = spk_global_index();
+     uint n = meta[0], nsub = meta[1], seed = meta[2];
+     if (i >= n) return;
++    // Patch 0055: the whole frame's pixel seeds the draw (meta 3/4/5 = first
++    // pixel, row stride delta, window width); zero on the whole-frame path.
++    uint gi = i + meta[3] + (i / max(meta[5], 1u)) * meta[4];
+     for (uint ch = 0u; ch < 3u; ++ch) {
+         precise float d = cmy[3u * i + ch] + lp[4u * ch];
+         precise float acc = 0.0;
+         for (uint sl = 0u; sl < nsub; ++sl) {
+-            Rng rng = rng_init(i, streams[ch] + sl * 10u, seed);
++            Rng rng = rng_init(gi, streams[ch] + sl * 10u, seed);
+             acc += layer_draw(rng, d, lp[4u * ch + 1u], lp[4u * ch + 2u], lp[4u * ch + 3u]);
+         }
+         dst[3u * i + ch] = acc;
+diff --git a/engine/src/shaders/vulkan/spk_lognormal_field.comp b/engine/src/shaders/vulkan/spk_lognormal_field.comp
+index a01ded6..cc2a15f 100644
+--- a/engine/src/shaders/vulkan/spk_lognormal_field.comp
++++ b/engine/src/shaders/vulkan/spk_lognormal_field.comp
+@@ -18,17 +18,20 @@ void main() {
+     uint i = spk_global_index();
+     uint n = meta[0], seed = meta[1], stream0 = meta[2], per_channel = meta[3];
+     if (i >= n) return;
++    // Patch 0055: the whole frame's pixel seeds the draw (meta 4/5/6 = first
++    // pixel, row stride delta, window width); zero on the whole-frame path.
++    uint gi = i + meta[4] + (i / max(meta[6], 1u)) * meta[5];
+     float m = p[0], s = p[1];
+     precise float sig = sqrt(log(1.0 + (s * s) / (m * m)));
+     precise float mu = log(m) - 0.5 * sig * sig;
+     if (per_channel != 0u) {
+         for (uint ch = 0u; ch < 3u; ++ch) {
+-            Rng rng = rng_init(i, stream0 + ch, seed);
++            Rng rng = rng_init(gi, stream0 + ch, seed);
+             precise float v = exp(mu + sig * rng_normal(rng));
+             dst[3u * i + ch] = v;
+         }
+     } else {
+-        Rng rng = rng_init(i, stream0, seed);
++        Rng rng = rng_init(gi, stream0, seed);
+         precise float v = exp(mu + sig * rng_normal(rng));
+         dst[3u * i] = v; dst[3u * i + 1u] = v; dst[3u * i + 2u] = v;
+     }

@@ -68,6 +68,16 @@ public:
     };
     Frame frame(uint32_t w, uint32_t h) const;
 
+    // A window of a larger frame (patch 0055). `full_w/full_h` are the frame
+    // the look's normalised geometry (vignette, masks, dust) was drawn for;
+    // `x0/y0` is where this window starts in it. All zero is the frame itself,
+    // the display and queue path byte for byte. A tiled export passes the
+    // film-edge canvas and each tile's origin, so every tile's vignette,
+    // mask and dust is the whole canvas's, not its own.
+    struct Window {
+        uint32_t full_w = 0, full_h = 0, x0 = 0, y0 = 0;
+    };
+
     // The table mixed in at `strength` (0..1) before white balance, after the
     // print and ahead of every slider. Null or strength 0 clears it.
     void set_lut(std::shared_ptr<const ColourTable> lut, float strength);
@@ -104,7 +114,8 @@ private:
 // `look`, on up to eight threads.
 void pack_rgba8_look(const Layer2& look, const uint16_t* src, size_t src_stride_px,
                      uint32_t w, uint32_t h, uint8_t* out, size_t out_stride,
-                     const OutputCancel& cancel = {});
-void apply_rgba16_in_place(const Layer2& look, uint16_t* px, size_t stride_px, uint32_t w, uint32_t h);
+                     const OutputCancel& cancel = {}, const Window& window = {});
+void apply_rgba16_in_place(const Layer2& look, uint16_t* px, size_t stride_px, uint32_t w, uint32_t h,
+                           const Window& window = {});
 
 }  // namespace spk::android

@@ -318,19 +318,21 @@ Layer2::Frame Layer2::frame(uint32_t w, uint32_t h) const {
 
 void pack_rgba8_look(const Layer2& look, const uint16_t* src, size_t src_stride_px,
                      uint32_t w, uint32_t h, uint8_t* out, size_t out_stride,
-                     const OutputCancel& cancel) {
+                     const OutputCancel& cancel, const Window& window) {
     cancel.check();
-    const Layer2::Frame frame = look.frame(w, h);
-    const float iw = 1.0f / std::max(1u, w), ih = 1.0f / std::max(1u, h);
+    const uint32_t fw = window.full_w ? window.full_w : w;
+    const uint32_t fh = window.full_h ? window.full_h : h;
+    const Layer2::Frame frame = look.frame(fw, fh);
+    const float iw = 1.0f / std::max(1u, fw), ih = 1.0f / std::max(1u, fh);
     rows(h, uint64_t(w) * h, [&](uint32_t y0, uint32_t y1) {
         for (uint32_t y = y0; y < y1; ++y) {
             if (cancel.cancelled()) return;
             const uint16_t* s = src + size_t(y) * src_stride_px * 4;
             uint8_t* d = out + size_t(y) * out_stride;
-            const float v = (y + 0.5f) * ih;
+            const float v = (window.y0 + y + 0.5f) * ih;
             for (uint32_t x = 0; x < w; ++x) {
                 float r = s[4 * x] / 65535.0f, g = s[4 * x + 1] / 65535.0f, b = s[4 * x + 2] / 65535.0f;
-                look.apply(r, g, b, (x + 0.5f) * iw, v, frame);
+                look.apply(r, g, b, (window.x0 + x + 0.5f) * iw, v, frame);
                 d[4 * x + 0] = uint8_t(std::lround(saturate(r) * 255.0f));
                 d[4 * x + 1] = uint8_t(std::lround(saturate(g) * 255.0f));
                 d[4 * x + 2] = uint8_t(std::lround(saturate(b) * 255.0f));
@@ -341,16 +343,19 @@ void pack_rgba8_look(const Layer2& look, const uint16_t* src, size_t src_stride_
     cancel.check();
 }
 
-void apply_rgba16_in_place(const Layer2& look, uint16_t* px, size_t stride_px, uint32_t w, uint32_t h) {
-    const Layer2::Frame frame = look.frame(w, h);
-    const float iw = 1.0f / std::max(1u, w), ih = 1.0f / std::max(1u, h);
+void apply_rgba16_in_place(const Layer2& look, uint16_t* px, size_t stride_px, uint32_t w, uint32_t h,
+                           const Window& window) {
+    const uint32_t fw = window.full_w ? window.full_w : w;
+    const uint32_t fh = window.full_h ? window.full_h : h;
+    const Layer2::Frame frame = look.frame(fw, fh);
+    const float iw = 1.0f / std::max(1u, fw), ih = 1.0f / std::max(1u, fh);
     rows(h, uint64_t(w) * h, [&](uint32_t y0, uint32_t y1) {
         for (uint32_t y = y0; y < y1; ++y) {
             uint16_t* s = px + size_t(y) * stride_px * 4;
-            const float v = (y + 0.5f) * ih;
+            const float v = (window.y0 + y + 0.5f) * ih;
             for (uint32_t x = 0; x < w; ++x) {
                 float r = s[4 * x] / 65535.0f, g = s[4 * x + 1] / 65535.0f, b = s[4 * x + 2] / 65535.0f;
-                look.apply(r, g, b, (x + 0.5f) * iw, v, frame);
+                look.apply(r, g, b, (window.x0 + x + 0.5f) * iw, v, frame);
                 s[4 * x + 0] = uint16_t(std::lround(saturate(r) * 65535.0f));
                 s[4 * x + 1] = uint16_t(std::lround(saturate(g) * 65535.0f));
                 s[4 * x + 2] = uint16_t(std::lround(saturate(b) * 65535.0f));

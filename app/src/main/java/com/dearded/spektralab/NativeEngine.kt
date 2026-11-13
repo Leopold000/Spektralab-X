@@ -119,6 +119,14 @@ object NativeEngine {
      */
     external fun overscanLayout(session: Long, width: Int, height: Int): String?
 
+    /**
+     * Where this render's tile sits in the *look's* frame (patch 0055): the
+     * film-edge canvas when the edge is on, otherwise the photo. The look's
+     * vignette, masks and dust then follow the whole picture on every tile.
+     * Call after [setRenderWindow], before [renderBitmap].
+     */
+    external fun setLookWindow(session: Long, fullW: Int, fullH: Int, x0: Int, y0: Int): Boolean
+
     /** Tier is "live", "preview" or "full". */
     external fun renderBitmap(session: Long, tier: String): Bitmap?
 

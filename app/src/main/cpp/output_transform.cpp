@@ -169,19 +169,22 @@ void finish_float(float c[3], const OutputTransform& xf) {
 template <typename Write>
 void convert_float(const float* src, size_t stride, uint32_t w, uint32_t h,
                    const Layer2* look, const OutputTransform& xf, const OutputCancel& cancel,
-                   const RawDevelopment* development, Write&& write) {
+                   const RawDevelopment* development, const Layer2::Window& window, Write&& write) {
     cancel.check();
     validate_float_source(src, stride, w, h, &xf);
-    const Layer2::Frame frame = look ? look->frame(w, h) : Layer2::Frame{};
-    const float iw = 1.0f / w, ih = 1.0f / h;
+    const uint32_t fw = window.full_w ? window.full_w : w;
+    const uint32_t fh = window.full_h ? window.full_h : h;
+    const Layer2::Frame frame = look ? look->frame(fw, fh) : Layer2::Frame{};
+    const float iw = 1.0f / std::max(1u, fw), ih = 1.0f / std::max(1u, fh);
     rows(h, uint64_t(w) * h, [&](uint32_t y0, uint32_t y1) {
         for (uint32_t y = y0; y < y1; ++y) {
             if (cancel.cancelled()) return;
             const float* s = src + size_t(y) * stride * 3;
+            const float v = (window.y0 + y + 0.5f) * ih;
             for (uint32_t x = 0; x < w; ++x) {
                 float c[3] = {s[3 * x], s[3 * x + 1], s[3 * x + 2]};
                 if (development) development->apply_encoded_prophoto(c);
-                if (look) look->apply(c[0], c[1], c[2], (x + 0.5f) * iw, (y + 0.5f) * ih, frame, true);
+                if (look) look->apply(c[0], c[1], c[2], (window.x0 + x + 0.5f) * iw, v, frame, true);
                 finish_float(c, xf);
                 write(y, x, c);
             }
@@ -193,20 +196,23 @@ void convert_float(const float* src, size_t stride, uint32_t w, uint32_t h,
 
 template <typename Write>
 void convert(const uint16_t* src, size_t src_stride_px, uint32_t w, uint32_t h,
-             const Layer2* look, const OutputTransform& xf, const OutputCancel& cancel, Write&& write) {
+             const Layer2* look, const OutputTransform& xf, const OutputCancel& cancel,
+             const Layer2::Window& window, Write&& write) {
     cancel.check();
-    const Layer2::Frame frame = look ? look->frame(w, h) : Layer2::Frame{};
-    const float iw = 1.0f / std::max(1u, w), ih = 1.0f / std::max(1u, h);
+    const uint32_t fw = window.full_w ? window.full_w : w;
+    const uint32_t fh = window.full_h ? window.full_h : h;
+    const Layer2::Frame frame = look ? look->frame(fw, fh) : Layer2::Frame{};
+    const float iw = 1.0f / std::max(1u, fw), ih = 1.0f / std::max(1u, fh);
     rows(h, uint64_t(w) * h, [&](uint32_t y0, uint32_t y1) {
         for (uint32_t y = y0; y < y1; ++y) {
             if (cancel.cancelled()) return;
             const uint16_t* s = src + size_t(y) * src_stride_px * 4;
-            const float v = (y + 0.5f) * ih;
+            const float v = (window.y0 + y + 0.5f) * ih;
             for (uint32_t x = 0; x < w; ++x) {
                 float c[3];
                 if (look) {
                     c[0] = s[4 * x] / 65535.0f; c[1] = s[4 * x + 1] / 65535.0f; c[2] = s[4 * x + 2] / 65535.0f;
-                    look->apply(c[0], c[1], c[2], (x + 0.5f) * iw, v, frame);
+                    look->apply(c[0], c[1], c[2], (window.x0 + x + 0.5f) * iw, v, frame);
                     // Upstream's grade ends at the UNORM16 boundary before any
                     // output conversion (spk_view_grade_body.glsl): clamp to
                     // 0..1 and round to 16 bits, so CAM16 never sees overshoot.
@@ -225,8 +231,9 @@ void convert(const uint16_t* src, size_t src_stride_px, uint32_t w, uint32_t h,
 }  // namespace
 
 void pack_rgba8(const uint16_t* src, size_t src_stride_px, uint32_t w, uint32_t h,
-                uint8_t* out, size_t out_stride, const Layer2* look, const OutputTransform& xf, const OutputCancel& cancel) {
-    convert(src, src_stride_px, w, h, look, xf, cancel, [&](uint32_t y, uint32_t x, const float c[3]) {
+                uint8_t* out, size_t out_stride, const Layer2* look, const OutputTransform& xf,
+                const OutputCancel& cancel, const Layer2::Window& window) {
+    convert(src, src_stride_px, w, h, look, xf, cancel, window, [&](uint32_t y, uint32_t x, const float c[3]) {
         uint8_t* d = out + size_t(y) * out_stride + 4 * size_t(x);
         d[0] = uint8_t(std::lround(saturate(c[0]) * 255.0f));
         d[1] = uint8_t(std::lround(saturate(c[1]) * 255.0f));
@@ -239,7 +246,7 @@ void pack_rgba16(const uint16_t* src, size_t src_stride_px, uint32_t w, uint32_t
                  std::vector<uint16_t>& out, const Layer2* look, const OutputTransform& xf, const OutputCancel& cancel) {
     cancel.check();
     out.assign(size_t(w) * h * 4, 65535);
-    convert(src, src_stride_px, w, h, look, xf, cancel, [&](uint32_t y, uint32_t x, const float c[3]) {
+    convert(src, src_stride_px, w, h, look, xf, cancel, Layer2::Window{}, [&](uint32_t y, uint32_t x, const float c[3]) {
         uint16_t* d = out.data() + (size_t(y) * w + x) * 4;
         d[0] = uint16_t(std::lround(saturate(c[0]) * 65535.0f));
         d[1] = uint16_t(std::lround(saturate(c[1]) * 65535.0f));
@@ -258,8 +265,9 @@ Rgba16Rows::Rgba16Rows(const uint16_t* src, size_t stride_px, uint32_t w, uint32
 
 void pack_float_rgba8(const float* src, size_t src_stride_px, uint32_t w, uint32_t h,
                       uint8_t* out, size_t out_stride, const Layer2* look, const OutputTransform& xf,
-                      const OutputCancel& cancel, const RawDevelopment* development) {
-    convert_float(src, src_stride_px, w, h, look, xf, cancel, development, [&](uint32_t y, uint32_t x, const float c[3]) {
+                      const OutputCancel& cancel, const RawDevelopment* development,
+                      const Layer2::Window& window) {
+    convert_float(src, src_stride_px, w, h, look, xf, cancel, development, window, [&](uint32_t y, uint32_t x, const float c[3]) {
         uint8_t* d = out + size_t(y) * out_stride + 4 * size_t(x);
         for (int k = 0; k < 3; ++k) d[k] = uint8_t(std::lround(saturate(c[k]) * 255.0f));
         d[3] = 255;
@@ -272,7 +280,7 @@ void pack_float_rgba16(const float* src, size_t src_stride_px, uint32_t w, uint3
     cancel.check();
     validate_float_source(src, src_stride_px, w, h, &xf);
     out.assign(size_t(w) * h * 4, 65535);
-    convert_float(src, src_stride_px, w, h, look, xf, cancel, development, [&](uint32_t y, uint32_t x, const float c[3]) {
+    convert_float(src, src_stride_px, w, h, look, xf, cancel, development, Layer2::Window{}, [&](uint32_t y, uint32_t x, const float c[3]) {
         uint16_t* d = out.data() + (size_t(y) * w + x) * 4;
         for (int k = 0; k < 3; ++k) d[k] = uint16_t(std::lround(saturate(c[k]) * 65535.0f));
     });

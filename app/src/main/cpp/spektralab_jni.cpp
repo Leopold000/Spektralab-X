@@ -103,6 +103,9 @@ struct Session {
     // a display or export render is packed; film cards show the film alone.
     spk::android::LookState look;
     const spk::android::Layer2* active_look() const { return look.active(); }
+    // Patch 0055: where this render's window sits in the look's frame (the
+    // film-edge canvas, or the photo). Zero is the whole frame, as before.
+    spk::android::Layer2::Window look_window;
     // The last display render, kept so an adjustment re-packs it (repack)
     // instead of re-running the engine. One tier only: RGBA16 uses 8 bytes per
     // pixel; no-film RGB float uses 12. Replaced on the next successful render.
@@ -368,15 +371,16 @@ Session* open_pixels(spk_engine* engine, std::vector<float>& rgb, uint32_t w, ui
 // threads: at the 3400 px tier it is ~8 M pixels, a visible slice of a drag.
 void pack_rgba8(const spk_result& r, uint8_t* out, size_t stride, const spk::android::Layer2* look = nullptr,
                 const spk::android::OutputTransform* xf = nullptr, const float* rgb = nullptr,
-                const spk::android::OutputCancel& cancel = {}, const spk::android::RawDevelopment* development = nullptr) {
+                const spk::android::OutputCancel& cancel = {}, const spk::android::RawDevelopment* development = nullptr,
+                const spk::android::Layer2::Window& window = {}) {
     cancel.check();
     if (rgb) {
         if (!xf || !xf->ready()) throw std::runtime_error("no-film float output transform unavailable");
-        spk::android::pack_float_rgba8(rgb, r.row_stride_px, r.width, r.height, out, stride, look, *xf, cancel, development);
+        spk::android::pack_float_rgba8(rgb, r.row_stride_px, r.width, r.height, out, stride, look, *xf, cancel, development, window);
         return;
     }
-    if (xf) { spk::android::pack_rgba8(r.rgba16, r.row_stride_px, r.width, r.height, out, stride, look, *xf, cancel); return; }
-    if (look) { spk::android::pack_rgba8_look(*look, r.rgba16, r.row_stride_px, r.width, r.height, out, stride, cancel); return; }
+    if (xf) { spk::android::pack_rgba8(r.rgba16, r.row_stride_px, r.width, r.height, out, stride, look, *xf, cancel, window); return; }
+    if (look) { spk::android::pack_rgba8_look(*look, r.rgba16, r.row_stride_px, r.width, r.height, out, stride, cancel, window); return; }
     const auto rows = [&](uint32_t y0, uint32_t y1) {
         for (uint32_t y = y0; y < y1; ++y) {
             if (cancel.cancelled()) return;
@@ -400,7 +404,8 @@ void pack_rgba8(const spk_result& r, uint8_t* out, size_t stride, const spk::and
 // order is R, G, B, A.
 jobject to_bitmap(JNIEnv* env, const spk_result& r, const spk::android::Layer2* look = nullptr,
                   const spk::android::OutputTransform* xf = nullptr, const float* rgb = nullptr,
-                  const spk::android::OutputCancel& cancel = {}, const spk::android::RawDevelopment* development = nullptr) {
+                  const spk::android::OutputCancel& cancel = {}, const spk::android::RawDevelopment* development = nullptr,
+                  const spk::android::Layer2::Window& window = {}) {
     cancel.check();
     jclass bitmap_class = env->FindClass("android/graphics/Bitmap");
     jclass config_class = env->FindClass("android/graphics/Bitmap$Config");
@@ -422,7 +427,7 @@ jobject to_bitmap(JNIEnv* env, const spk_result& r, const spk::android::Layer2* 
     }
     PixelLock lock(env, bitmap);
     if (!lock.ok) { fail("cannot lock bitmap pixels"); return nullptr; }
-    pack_rgba8(r, static_cast<uint8_t*>(lock.pixels), info.stride, look, xf, rgb, cancel, development);
+    pack_rgba8(r, static_cast<uint8_t*>(lock.pixels), info.stride, look, xf, rgb, cancel, development, window);
     cancel.check();
     return bitmap;
 }
@@ -1368,6 +1373,27 @@ JNI_FN(jboolean, setRenderWindow)(JNIEnv*, jobject, jlong handle,
     return JNI_FALSE;
 }
 
+// Patch 0055 at the app boundary: where this render's window sits in the
+// *look's* frame. The engine's window is the frame/gate layout (the pitch and
+// the gate come from it); the look's frame is the picture the preview shows,
+// which is the film-edge canvas when the edge is on. Keeping the two separate
+// lets the look's vignette, masks and dust be the whole picture's on every
+// tile. Call after `setRenderWindow`, before `renderBitmap`.
+JNI_FN(jboolean, setLookWindow)(JNIEnv*, jobject, jlong handle,
+                                jint full_w, jint full_h, jint x0, jint y0) {
+    auto* s = reinterpret_cast<Session*>(handle);
+    if (!s) { fail("no session"); return JNI_FALSE; }
+    if (full_w <= 0 || full_h <= 0 || x0 < 0 || y0 < 0 || x0 >= full_w || y0 >= full_h) {
+        fail("look window: invalid frame");
+        return JNI_FALSE;
+    }
+    s->look_window.full_w = uint32_t(full_w);
+    s->look_window.full_h = uint32_t(full_h);
+    s->look_window.x0 = uint32_t(x0);
+    s->look_window.y0 = uint32_t(y0);
+    return JNI_TRUE;
+}
+
 // The film canvas and gate quads for a whole frame of this size, without
 // rendering: the tiled film-edge export asks before it cuts the frame up.
 JNI_FN(jstring, overscanLayout)(JNIEnv* env, jobject, jlong handle, jint width, jint height) {
@@ -1391,19 +1417,20 @@ JNI_FN(jstring, overscanLayout)(JNIEnv* env, jobject, jlong handle, jint width, 
 // `r` into `reuse` when it is the same size, else into a new Bitmap.
 jobject pack_into(JNIEnv* env, const spk_result& r, jobject reuse, const spk::android::Layer2* look,
                   const spk::android::OutputTransform* xf, const float* rgb = nullptr,
-                  const spk::android::OutputCancel& cancel = {}, const spk::android::RawDevelopment* development = nullptr) {
+                  const spk::android::OutputCancel& cancel = {}, const spk::android::RawDevelopment* development = nullptr,
+                  const spk::android::Layer2::Window& window = {}) {
     cancel.check();
     AndroidBitmapInfo info{};
     if (reuse && AndroidBitmap_getInfo(env, reuse, &info) == ANDROID_BITMAP_RESULT_SUCCESS &&
         info.format == ANDROID_BITMAP_FORMAT_RGBA_8888 && info.width == r.width && info.height == r.height) {
         PixelLock lock(env, reuse);
         if (lock.ok) {
-            pack_rgba8(r, static_cast<uint8_t*>(lock.pixels), info.stride, look, xf, rgb, cancel, development);
+            pack_rgba8(r, static_cast<uint8_t*>(lock.pixels), info.stride, look, xf, rgb, cancel, development, window);
             cancel.check();
             return reuse;
         }
     }
-    return to_bitmap(env, r, look, xf, rgb, cancel, development);
+    return to_bitmap(env, r, look, xf, rgb, cancel, development, window);
 }
 
 JNI_FN(jobject, renderBitmap)(JNIEnv* env, jobject, jlong handle, jstring tier_j) {
@@ -1413,7 +1440,8 @@ JNI_FN(jobject, renderBitmap)(JNIEnv* env, jobject, jlong handle, jstring tier_j
     try {
         ResultGuard result;
         if (!render(s, str(env, tier_j), result.r, result.float_rgb, cancel)) return nullptr;
-        return to_bitmap(env, result.r, s->active_look(), s->xf(), result.float_rgb.empty() ? nullptr : result.float_rgb.data(), cancel, s->development());
+        return to_bitmap(env, result.r, s->active_look(), s->xf(), result.float_rgb.empty() ? nullptr : result.float_rgb.data(),
+                         cancel, s->development(), s->look_window);
     } catch (const std::exception& e) {
         fail(std::string("render: ") + e.what());
     } catch (...) {
@@ -1580,7 +1608,7 @@ JNI_FN(jobject, renderReuse)(JNIEnv* env, jobject, jlong handle, jstring tier_j,
     try {
         ResultGuard result;
         if (!render(s, str(env, tier_j), result.r, result.float_rgb, cancel)) return nullptr;
-        jobject out = pack_into(env, result.r, reuse, s->active_look(), s->xf(), result.float_rgb.empty() ? nullptr : result.float_rgb.data(), cancel, s->development());
+        jobject out = pack_into(env, result.r, reuse, s->active_look(), s->xf(), result.float_rgb.empty() ? nullptr : result.float_rgb.data(), cancel, s->development(), s->look_window);
         cancel.check();
         if (out) s->keep(result.r, result.float_rgb);
         return out;
