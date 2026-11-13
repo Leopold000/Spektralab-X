@@ -1,0 +1,478 @@
+Window the film canvas for a tiled film-edge export.
+Co-created with DeepSeek, 2026-11-13. See NOTICE for project terms.
+
+The film edge is a whole-canvas effect: the gate, the perforation pitch, the
+edge print, the fog and the scan registration are all laid out once, from the
+frame's size and the seeds. A phone cannot render the 69 MP canvas of a 135
+edge in one storage buffer, so the canvas is rendered in windows of itself.
+
+The layout stays the whole frame's on every tile -- the pitch comes from the
+full frame, not from the window crop, and the off-frame cover is sampled with
+the same millimetre coordinates. Only the dispatch rectangle and the source
+rectangle move: a window of the canvas is filled from the corresponding crop
+of the frame, plus the overlap the host discards.
+
+`spk_overscan_layout_at` lays the canvas out without rendering, so a host can
+learn the canvas size and the gate quads before it cuts the frame into tiles;
+`spk_set_render_window` gives a session its window and its source rectangle.
+Both default to the whole canvas and the whole frame, so the shipping
+whole-frame path reads the same parameters and is byte for byte unchanged.
+The date back is refused in a windowed render for now: its imprint is
+rasterised in whole-canvas pixels and a glyph can straddle a window edge.
+
+diff --git a/engine/include/spektrafilm/spk_engine.h b/engine/include/spektrafilm/spk_engine.h
+index d8ec49d..3d366cc 100644
+--- a/engine/include/spektrafilm/spk_engine.h
++++ b/engine/include/spektrafilm/spk_engine.h
+@@ -246,6 +246,30 @@ spk_status spk_scene_latitude(spk_session* session, const char* request_json, ch
+  * quads hold at every tier. Never renders. */
+ spk_status spk_overscan_geometry(spk_session* session, char** out_json);
+ 
++/* Patch 0054 -- a window of the film canvas, for an Android tiled export that
++ * cannot render the whole canvas at once. All sizes are pixels of the frame
++ * the session was opened on. `full_w/full_h` are that frame's size, so the
++ * pitch, the gate, the perforation grid and the edge print are the whole
++ * frame's on every tile; `win_*` is the canvas rectangle this render fills;
++ * `src_*` is the frame rectangle the session's source image holds (the host
++ * cuts it out), which lets frame sampling be offset back into it.
++ *
++ * Every tile of one export must use the same full size, seeds and window
++ * origin arithmetic; the canvases then line up pixel for pixel. The output of
++ * `spk_render("full")` is `win_w` x `win_h`. Pass win_w or win_h zero to clear
++ * the window (the shipping whole-frame path, byte for byte). Only valid with
++ * the film edge on. Call after `spk_open` and before the first render. */
++spk_status spk_set_render_window(spk_session* session,
++                                 uint32_t full_w, uint32_t full_h,
++                                 uint32_t win_x, uint32_t win_y, uint32_t win_w, uint32_t win_h,
++                                 uint32_t src_x, uint32_t src_y, uint32_t src_w, uint32_t src_h);
++
++/* The film canvas and gate quads for a whole frame of `w` x `h`, laid out
++ * without rendering. Same JSON as `spk_overscan_geometry`, and the layout is
++ * kept as if a film run had just made it -- so a tiled export can ask where
++ * the canvas is before it cuts the frame into tiles. */
++spk_status spk_overscan_layout_at(spk_session* session, uint32_t w, uint32_t h, char** out_json);
++
+ /* Tiers are the three API-SPEC §6 names: "live", "preview", "full". */
+ spk_status spk_reprint(spk_session* session, const char* tier, spk_result* out);
+ spk_status spk_render(spk_session* session, const char* tier, spk_result* out);
+diff --git a/engine/src/pipeline/engine.cpp b/engine/src/pipeline/engine.cpp
+index eb476a6..730600e 100644
+--- a/engine/src/pipeline/engine.cpp
++++ b/engine/src/pipeline/engine.cpp
+@@ -199,6 +199,11 @@ struct spk_session {
+     // one copy is unavoidable; this makes that copy the upload.
+     Image source;
+ 
++    // Patch 0054: the film-canvas window this session renders. Inactive is
++    // the shipping whole-frame path; every tile of a tiled export sets it
++    // once, after `open` and before the first render.
++    Pipeline::RenderWindow window;
++
+ #ifndef __APPLE__
+     // No image buffer is retained here. The file owns the exact byte copy,
+     // and the indices preserve source/full-tier aliases on restoration.
+@@ -1331,6 +1336,15 @@ bool materialise(spk_session* session, const Image& rgb, spk_result* out, std::s
+     return ok;
+ }
+ 
++// Patch 0054: the window lives on the session, not on the pipeline, because a
++// print-layer `set_params` replaces the pipeline. Every render re-applies it
++// before the frame's shape (and so the pitch) is set.
++void apply_render_window(spk_session* session) {
++    if (!session->pipeline) return;
++    if (session->window.active) session->pipeline->set_render_window(session->window);
++    else session->pipeline->clear_render_window();
++}
++
+ spk_status render_tier(spk_session* session, const char* tier_name, bool use_reprint,
+                        spk_result* out) {
+     if (!session || !out) { g_error = "session or result is null"; return SPK_ERR_INVALID_ARG; }
+@@ -1380,6 +1394,7 @@ spk_status render_tier(spk_session* session, const char* tier_name, bool use_rep
+     // may be one the *previous* pipeline made.
+     Image tier_source;
+     bool ok = tier_image(session, *tier, tier_source, error);
++    if (ok) apply_render_window(session);
+     if (ok) session->pipeline->set_source_shape(tier_source.w, tier_source.h, session->source.w, session->source.h);
+     if (ok) ok = negative_for(session, *tier, &session->progress, negative, error);
+     // After the negative, which a film run lays out for itself: this is for
+@@ -2733,6 +2748,65 @@ spk_status spk_overscan_geometry(spk_session* session, char** out_json) {
+     return SPK_OK;
+ }
+ 
++spk_status spk_overscan_layout_at(spk_session* session, uint32_t w, uint32_t h, char** out_json) {
++    if (!session || !out_json) { g_error = "session or out_json is null"; return SPK_ERR_INVALID_ARG; }
++    std::lock_guard<std::mutex> guard(session->lock);
++    g_error.clear();
++    if (!session->pipeline) { g_error = "no pipeline"; return SPK_ERR_INVALID_ARG; }
++    std::string error;
++    if (!session->pipeline->overscan_layout_at(w, h, error)) { g_error = error; return SPK_ERR_USER; }
++    Json reply;
++    std::string parse_error;
++    const std::string text = session->pipeline->overscan_geometry_json();
++    if (!Json::parse(text, reply, parse_error)) { g_error = "overscan layout: " + parse_error; return SPK_ERR_INTERNAL; }
++    *out_json = dup_json(reply);
++    return SPK_OK;
++}
++
++spk_status spk_set_render_window(spk_session* session,
++                                 uint32_t full_w, uint32_t full_h,
++                                 uint32_t win_x, uint32_t win_y, uint32_t win_w, uint32_t win_h,
++                                 uint32_t src_x, uint32_t src_y, uint32_t src_w, uint32_t src_h) {
++    // `full_w/full_h` are the frame the layout is for; `win_*` is a rectangle
++    // of the (larger) canvas, so no relation between them is required here.
++    if (!session) { g_error = "session is null"; return SPK_ERR_INVALID_ARG; }
++    std::lock_guard<std::mutex> guard(session->lock);
++    g_error.clear();
++    Pipeline::RenderWindow window;
++    if (win_w != 0 && win_h != 0) {
++        if (!session->params.film_render.overscan.active) {
++            g_error = "render window: the film edge is off";
++            return SPK_ERR_USER;
++        }
++        if (full_w == 0 || full_h == 0 || src_w == 0 || src_h == 0) {
++            g_error = "render window: the full frame and the source rectangle must be non-empty";
++            return SPK_ERR_INVALID_ARG;
++        }
++        // The canvas is larger than the frame (it carries the rebate), so the
++        // window cannot be bounds-checked here; the film node has the layout
++        // and clamps nothing, but the host cuts the window from the canvas it
++        // asked for with `spk_overscan_layout_at`.
++        window.active = true;
++        window.full_w = full_w; window.full_h = full_h;
++        window.win_x = win_x; window.win_y = win_y; window.win_w = win_w; window.win_h = win_h;
++        window.src_x = src_x; window.src_y = src_y; window.src_w = src_w; window.src_h = src_h;
++    }
++    session->window = window;
++    // A cached negative is a different window's pixels; like a seed change,
++    // the setter invalidates it rather than letting the next render reuse it.
++    for (auto& entry : session->tiers) {
++        spk_session::TierState& state = entry.second;
++        state.negative = Image{};
++        state.has_negative = false;
++        state.overscan_frame_w = state.overscan_frame_h = 0;
++#ifndef __APPLE__
++        state.view_print = Image{};
++#endif
++    }
++    if (session->pipeline) apply_render_window(session);
++    return SPK_OK;
++}
++
+ spk_status spk_scene_latitude(spk_session* session, const char* request_json, char** out_json) {
+     if (!session) { g_error = "session is null"; return SPK_ERR_INVALID_ARG; }
+     Json request = Json::object();
+diff --git a/engine/src/pipeline/overscan.cpp b/engine/src/pipeline/overscan.cpp
+index 3a51683..16a441b 100644
+--- a/engine/src/pipeline/overscan.cpp
++++ b/engine/src/pipeline/overscan.cpp
+@@ -64,7 +64,12 @@ enum OsP : int {
+     P_CARRIER = 199,
+     P_LEAKS = 200,          // up to kMaxLeaks x (s, side, amp, sigma_s, sigma_t)
+     P_PAIR_ADV = 260,       // > 0: the same gate exposed again this far along (a half-frame pair)
+-    P_COUNT = 261
++    // Patch 0054: a windowed render. `win_*` is the canvas pixel this window
++    // starts at (the dispatch's own `i` is window-local); `src_*` the frame
++    // pixel this window's source image starts at. All zero is the whole canvas
++    // and the whole frame, so the shipping path reads the same numbers.
++    P_WIN_X = 261, P_WIN_Y, P_SRC_X, P_SRC_Y,
++    P_COUNT = 265
+ };
+ constexpr int kMaxLeaks = 12;
+ // How far past each long edge of the film a strip scan reaches, mm.
+@@ -506,6 +511,17 @@ void Pipeline::overscan_frame(uint32_t& frame_w, uint32_t& frame_h) const {
+ 
+ bool Pipeline::full_output_size(uint32_t w, uint32_t h, uint32_t& out_w, uint32_t& out_h,
+                                 std::string& error) {
++    // Patch 0054: the full tier of a windowed session *is* the window. The
++    // full canvas is the host's to assemble, and it is the layout's to hold.
++    if (render_window_.active) {
++        if (render_window_.win_w == 0 || render_window_.win_h == 0) {
++            error = "render window: the window is empty";
++            return false;
++        }
++        out_w = render_window_.win_w;
++        out_h = render_window_.win_h;
++        return true;
++    }
+     const auto& g = params_.io.geometry;
+     out_w = std::max(1u, uint32_t(std::lround(g.crop_w * w)));
+     out_h = std::max(1u, uint32_t(std::lround(g.crop_h * h)));
+@@ -526,6 +542,16 @@ bool Pipeline::full_output_size(uint32_t w, uint32_t h, uint32_t& out_w, uint32_
+     return true;
+ }
+ 
++bool Pipeline::overscan_layout_at(uint32_t w, uint32_t h, std::string& error) {
++    if (!overscan_wanted()) { error = "overscan: film edge is off"; return false; }
++    if (w == 0 || h == 0) { error = "overscan: the frame is empty"; return false; }
++    if (render_window_.active) { error = "overscan: a layout query cannot run inside a windowed render"; return false; }
++    // A query session never renders: laying the canvas out as a whole frame of
++    // this size is exactly what its film run would do, pitch and all.
++    set_source_shape(w, h, w, h);
++    return overscan_layout(w, h, error);
++}
++
+ bool Pipeline::set_overscan_frame(uint32_t frame_w, uint32_t frame_h, std::string& error) {
+     if (!overscan_wanted() || frame_w == 0 || frame_h == 0) return true;
+     if (overscan_.valid && overscan_.frame_w == frame_w && overscan_.frame_h == frame_h &&
+@@ -816,14 +842,31 @@ bool Pipeline::overscan_layout(uint32_t frame_w, uint32_t frame_h, std::string&
+     }
+ 
+     L.valid = true;
++    // Patch 0054: a window is not part of the layout's decisions -- it only
++    // says which slice of the canvas this run draws. Recorded here so a
++    // print-side reprint of the same negative sees the same one.
++    if (render_window_.active) {
++        L.win_x = render_window_.win_x; L.win_y = render_window_.win_y;
++        L.win_w = render_window_.win_w; L.win_h = render_window_.win_h;
++        L.src_x = render_window_.src_x; L.src_y = render_window_.src_y;
++        L.src_w = render_window_.src_w; L.src_h = render_window_.src_h;
++    }
+     return true;
+ }
+ 
+ void Pipeline::overscan_params_block(std::vector<float>& P) const {
+     const OverscanLayout& L = overscan_;
+     P.assign(P_COUNT, 0.0f);
+-    P[P_CW] = float(L.canvas_w); P[P_CH] = float(L.canvas_h); P[P_PX] = float(L.px);
+-    P[P_FW] = float(L.frame_w); P[P_FH] = float(L.frame_h);
++    // Under a window these are the window's output size and its source
++    // rectangle, not the canvas's and the frame's; the offsets below turn a
++    // window-local dispatch index back into canvas coordinates.
++    const uint32_t out_w = L.win_w ? L.win_w : L.canvas_w;
++    const uint32_t out_h = L.win_h ? L.win_h : L.canvas_h;
++    P[P_CW] = float(out_w); P[P_CH] = float(out_h); P[P_PX] = float(L.px);
++    P[P_FW] = float(L.win_w ? L.src_w : L.frame_w);
++    P[P_FH] = float(L.win_w ? L.src_h : L.frame_h);
++    P[P_WIN_X] = float(L.win_x); P[P_WIN_Y] = float(L.win_y);
++    P[P_SRC_X] = float(L.src_x); P[P_SRC_Y] = float(L.src_y);
+     P[P_A00] = float(L.A[0]); P[P_A01] = float(L.A[1]); P[P_A10] = float(L.A[2]); P[P_A11] = float(L.A[3]);
+     P[P_CS] = float(L.cs); P[P_CT] = float(L.ct); P[P_CU] = float(L.cu); P[P_CV] = float(L.cv);
+     P[P_VERTICAL] = L.vertical ? 1.0f : 0.0f;
+@@ -930,10 +973,18 @@ bool rasterise(const OverscanLayout& L, const Group& g, std::vector<float>& cov,
+         }
+     }
+     const double pad = 3.0 + 3.0 * g.blur_mm / L.px;
+-    x0 = std::max(0, int(std::floor(xmin - pad)));
+-    y0 = std::max(0, int(std::floor(ymin - pad)));
+-    const int x1 = std::min(int(L.canvas_w), int(std::ceil(xmax + pad)));
+-    const int y1 = std::min(int(L.canvas_h), int(std::ceil(ymax + pad)));
++    // Patch 0054: an imprint is placed in whole-canvas pixels; under a window
++    // only the part inside the window exists, and `x0/y0` stay whole-canvas
++    // here so the film-to-canvas transform below is unchanged. The dispatch
++    // subtracts the window origin itself.
++    const int wx = L.win_w ? int(L.win_x) : 0;
++    const int wy = L.win_h ? int(L.win_y) : 0;
++    const int wx1 = wx + (L.win_w ? int(L.win_w) : int(L.canvas_w));
++    const int wy1 = wy + (L.win_h ? int(L.win_h) : int(L.canvas_h));
++    x0 = std::max(wx, int(std::floor(xmin - pad)));
++    y0 = std::max(wy, int(std::floor(ymin - pad)));
++    const int x1 = std::min(wx1, int(std::ceil(xmax + pad)));
++    const int y1 = std::min(wy1, int(std::ceil(ymax + pad)));
+     w = x1 - x0; h = y1 - y0;
+     if (w <= 0 || h <= 0) return false;
+ 
+@@ -2273,20 +2324,31 @@ bool Pipeline::node_overscan(const Image& in, Image& out, std::string& error) {
+             return false;
+         }
+     }
++    if (render_window_.active && di.active) {
++        error = "date_imprint: not supported in a windowed render yet";
++        return false;
++    }
+     const bool date_only = !overscan_wanted() && di.active;
+     if (!overscan_wanted() && !date_only) { out = in; return true; }
+     Timer t(this, "filming.expose.overscan");
+-    frame_w_mm_ = in.w * pixel_size_um_ / 1000.0;
+-    frame_h_mm_ = in.h * pixel_size_um_ / 1000.0;
++    // Patch 0054: the layout, the edge print and the gate are the *whole*
++    // frame's even when only a window of the canvas is drawn. The source is a
++    // crop, so its own size must not be mistaken for the frame's.
++    const uint32_t frame_px_w = render_window_.active ? render_window_.full_w : in.w;
++    const uint32_t frame_px_h = render_window_.active ? render_window_.full_h : in.h;
++    frame_w_mm_ = frame_px_w * pixel_size_um_ / 1000.0;
++    frame_h_mm_ = frame_px_h * pixel_size_um_ / 1000.0;
+ 
+     Image canvas;
+     if (overscan_wanted()) {
+-        if (!overscan_layout(in.w, in.h, error)) return false;
++        if (!overscan_layout(frame_px_w, frame_px_h, error)) return false;
+         std::vector<float> P;
+         overscan_params_block(P);
+         gpu::BufferRef pb = gpu_->upload(P.data(), P.size() * sizeof(float), error);
+         if (!pb) return false;
+-        canvas.h = overscan_.canvas_h; canvas.w = overscan_.canvas_w; canvas.c = 3;
++        const uint32_t out_w = overscan_.win_w ? overscan_.win_w : overscan_.canvas_w;
++        const uint32_t out_h = overscan_.win_h ? overscan_.win_h : overscan_.canvas_h;
++        canvas.h = out_h; canvas.w = out_w; canvas.c = 3;
+         canvas.buf = gpu_->alloc(canvas.bytes(), error);
+         if (!canvas.buf) return false;
+         const uint32_t n[1] = {uint32_t(canvas.pixels())};
+@@ -2362,7 +2424,11 @@ bool Pipeline::node_overscan(const Image& in, Image& out, std::string& error) {
+         if (!rasterise(gi < placed.size() ? placed[gi] : overscan_, gg, cov, x0, y0, w, h)) continue;
+         gpu::BufferRef mb = gpu_->upload(cov.data(), cov.size() * sizeof(float), error);
+         if (!mb) return false;
+-        const float M[9] = {float(x0), float(y0), float(w), float(h), float(canvas.w), float(canvas.h),
++        // Patch 0054: `rasterise` clips in whole-canvas pixels; the coverage
++        // buffer and the dispatch are window-local, so move the box's origin.
++        const int mask_x = x0 - (overscan_.win_w ? int(overscan_.win_x) : 0);
++        const int mask_y = y0 - (overscan_.win_h ? int(overscan_.win_y) : 0);
++        const float M[9] = {float(mask_x), float(mask_y), float(w), float(h), float(canvas.w), float(canvas.h),
+                             float(gg.exposure[0]), float(gg.exposure[1]), float(gg.exposure[2])};
+         const uint32_t n[1] = {uint32_t(size_t(w) * size_t(h))};
+         if (!gpu_->dispatch("spk_overscan_add_mask",
+@@ -2376,7 +2442,9 @@ bool Pipeline::node_overscan(const Image& in, Image& out, std::string& error) {
+ 
+ bool Pipeline::node_overscan_film_present(const Image& in, Image& out, std::string& error) {
+     if (!overscan_wanted()) { out = in; return true; }
+-    if (!overscan_.valid || in.w != overscan_.canvas_w || in.h != overscan_.canvas_h) {
++    const uint32_t out_w = overscan_.win_w ? overscan_.win_w : overscan_.canvas_w;
++    const uint32_t out_h = overscan_.win_h ? overscan_.win_h : overscan_.canvas_h;
++    if (!overscan_.valid || in.w != out_w || in.h != out_h) {
+         error = "overscan: the negative does not match this pipeline's overscan layout";
+         return false;
+     }
+@@ -2394,7 +2462,9 @@ bool Pipeline::node_overscan_film_present(const Image& in, Image& out, std::stri
+ 
+ bool Pipeline::node_overscan_light(const Image& in, Image& out, std::string& error) {
+     if (!overscan_wanted()) { out = in; return true; }
+-    if (!overscan_.valid || in.w != overscan_.canvas_w || in.h != overscan_.canvas_h) {
++    const uint32_t out_w = overscan_.win_w ? overscan_.win_w : overscan_.canvas_w;
++    const uint32_t out_h = overscan_.win_h ? overscan_.win_h : overscan_.canvas_h;
++    if (!overscan_.valid || in.w != out_w || in.h != out_h) {
+         error = "overscan: the print does not match this pipeline's overscan layout";
+         return false;
+     }
+diff --git a/engine/src/pipeline/pipeline.cpp b/engine/src/pipeline/pipeline.cpp
+index 312be0a..6a0982e 100644
+--- a/engine/src/pipeline/pipeline.cpp
++++ b/engine/src/pipeline/pipeline.cpp
+@@ -150,6 +150,14 @@ void Pipeline::set_source_long_edge(uint32_t long_edge, uint32_t frame_long_edge
+ }
+ 
+ void Pipeline::set_source_shape(uint32_t w, uint32_t h, uint32_t full_w, uint32_t full_h) {
++    // Patch 0054: under a render window the source is only a window's crop, so
++    // its own long edge says nothing about the film's pitch. The full frame's
++    // does, and that is what every micrometre-specified effect must see.
++    if (render_window_.active && render_window_.full_w > 0 && render_window_.full_h > 0) {
++        const uint32_t long_edge = std::max(render_window_.full_w, render_window_.full_h);
++        set_source_long_edge(long_edge, long_edge);
++        return;
++    }
+     const auto& g = params_.io.geometry;
+     auto edge = [&](uint32_t width, uint32_t height) {
+         if (overscan_wanted() || params_.film_render.date_imprint.active)
+@@ -658,8 +666,20 @@ bool Pipeline::node_geometry(const Image& in, Image& out, std::string& error) {
+     // to pass the frame's shape in, which is what `film_prefix` already does
+     // for the identical line: whoever takes the class off `geometry` should
+     // take the shape as a parameter at the same time.
+-    source_long_edge_ = std::max(in.h, in.w);
++    // Patch 0054: a windowed render's `in` is only the window's source, so
++    // the pitch is still the full frame's -- `set_source_shape` already put it
++    // there. The crop itself is the host's (it cuts the window out), so the
++    // only cropped shape a window can see is an identity one.
+     const GeometryParams& g = params_.io.geometry;
++    if (render_window_.active) {
++        if (!g.is_identity()) {
++            error = "render window: the geometry crop must be identity; the host cuts the window";
++            return false;
++        }
++        out = in;
++        return true;
++    }
++    source_long_edge_ = std::max(in.h, in.w);
+     if (g.is_identity()) { out = in; return true; }
+     Timer t(this, "preprocess.geometry");
+ 
+diff --git a/engine/src/pipeline/pipeline.hpp b/engine/src/pipeline/pipeline.hpp
+index 906c6e7..cde31bd 100644
+--- a/engine/src/pipeline/pipeline.hpp
++++ b/engine/src/pipeline/pipeline.hpp
+@@ -255,7 +255,12 @@ struct OverscanLayout {
+     std::string format;
+     double px = 0.0;                      // mm per pixel (the frame's pitch)
+     uint32_t frame_w = 0, frame_h = 0;
+-    uint32_t canvas_w = 0, canvas_h = 0;
++    uint32_t canvas_w = 0, canvas_h = 0;   // the whole canvas
++    // Patch 0054: a windowed render fills `win_*` of that canvas and was given
++    // `src_*` of the frame as its source. win_w == 0 is the whole canvas and an
++    // all-zero src is the whole frame, which is the shipping path byte for byte.
++    uint32_t win_x = 0, win_y = 0, win_w = 0, win_h = 0;
++    uint32_t src_x = 0, src_y = 0, src_w = 0, src_h = 0;
+     bool vertical = false;                // the film runs along the image's y axis
+     double gate_s0 = 0, gate_t0 = 0, gate_along = 0, gate_across = 0;
+     double pair_adv = 0;                  // > 0: a half-frame pair, the same gate again this far along
+@@ -321,6 +326,26 @@ public:
+     void overscan_frame(uint32_t& frame_w, uint32_t& frame_h) const;
+     std::string overscan_geometry_json() const;
+     bool set_overscan_frame(uint32_t frame_w, uint32_t frame_h, std::string& error);
++    // Lay the film edge out at a given frame size without rendering, so a host
++    // can ask for the canvas and gate quads before it cuts the frame into
++    // tiles. The layout is kept, as if a film run had just made it.
++    bool overscan_layout_at(uint32_t w, uint32_t h, std::string& error);
++    // Patch 0054 -- a window of the film canvas, for an export too large to
++    // render at once. `full_w/full_h` are the frame's pixels at this tier (the
++    // pitch, the layout and the acquisition all come from it), `win_*` is the
++    // canvas rectangle this render fills and `src_*` is the frame rectangle
++    // this session's source image holds. The window is expressed in full
++    // canvas pixels, so every tile's layout is the same one, and only the
++    // dispatch changes. Cleared, the pipeline is exactly the whole-frame one.
++    struct RenderWindow {
++        bool active = false;
++        uint32_t full_w = 0, full_h = 0;
++        uint32_t win_x = 0, win_y = 0, win_w = 0, win_h = 0;
++        uint32_t src_x = 0, src_y = 0, src_w = 0, src_h = 0;
++    };
++    void set_render_window(const RenderWindow& window) { render_window_ = window; }
++    void clear_render_window() { render_window_ = RenderWindow{}; }
++    const RenderWindow& render_window() const { return render_window_; }
+     // The film's pixel pitch, from the frame this pipeline is about to render.
+     //
+     // It must be set before *any* run, not just before `run_film`, and that is
+@@ -754,6 +779,8 @@ private:
+     // RFC-032 §27: kept across a reprint of the cached negative, which the
+     // print side's no-film mask must match pixel for pixel.
+     OverscanLayout overscan_;
++    // Patch 0054: the window the next film run fills (all zero: the canvas).
++    RenderWindow render_window_;
+     double frame_w_mm_ = 0.0, frame_h_mm_ = 0.0;
+ 
+     // --- baked, persistent ----------------------------------------------
+diff --git a/engine/src/shaders/vulkan/spk_overscan_body.glsl b/engine/src/shaders/vulkan/spk_overscan_body.glsl
+index f4baad8..47a256d 100644
+--- a/engine/src/shaders/vulkan/spk_overscan_body.glsl
++++ b/engine/src/shaders/vulkan/spk_overscan_body.glsl
+@@ -84,12 +84,19 @@ const uint P_WALL_SCATTER = 198u;
+ const uint P_CARRIER = 199u;
+ const uint P_LEAKS = 200u;
+ const uint P_PAIR_ADV = 260u;
+-const uint P_COUNT = 261u;
++// Patch 0054: a windowed render. P_WIN_* is where this window's (x, y) sits in
++// the whole canvas; P_SRC_* is where the window's source image sits in the
++// whole frame. All zero on the shipping whole-frame path.
++const uint P_WIN_X = 261u;
++const uint P_WIN_Y = 262u;
++const uint P_SRC_X = 263u;
++const uint P_SRC_Y = 264u;
++const uint P_COUNT = 265u;
+ const uint kQStride = 10u;
+ 
+ vec2 canvas_to_film(float x, float y) {
+-    const float u = (x + 0.5f) * params.v[P_PX] - params.v[P_CU];
+-    const float v = (y + 0.5f) * params.v[P_PX] - params.v[P_CV];
++    const float u = (x + params.v[P_WIN_X] + 0.5f) * params.v[P_PX] - params.v[P_CU];
++    const float v = (y + params.v[P_WIN_Y] + 0.5f) * params.v[P_PX] - params.v[P_CV];
+     return vec2(params.v[P_A00] * u + params.v[P_A01] * v + params.v[P_CS], params.v[P_A10] * u + params.v[P_A11] * v + params.v[P_CT]);
+ }
+ 
+@@ -177,6 +184,11 @@ float penumbra(float d, float r) {
+ }
+ 
+ vec3 sample_frame(float fx, float fy, uint fw, uint fh) {
++    // Patch 0054: `fx/fy` are whole-frame pixels; a windowed source starts at
++    // P_SRC_*, and `fw/fh` are that window's size. Clamping at the window's
++    // edge only ever touches the overlap the host discards.
++    fx -= params.v[P_SRC_X];
++    fy -= params.v[P_SRC_Y];
+     fx = clamp(fx, 0.0f, float(fw) - 1.0f);
+     fy = clamp(fy, 0.0f, float(fh) - 1.0f);
+     const uint x0 = uint(floor(fx)), y0 = uint(floor(fy));

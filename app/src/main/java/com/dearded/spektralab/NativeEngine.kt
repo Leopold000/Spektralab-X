@@ -101,6 +101,24 @@ object NativeEngine {
      */
     external fun solve(session: Long, target: String): String?
 
+    /**
+     * One window of the film canvas (patch 0054). The layout, gate and edge
+     * print stay the whole frame's, so every tile lines up; [winX]/[winY] is
+     * where this window starts on the full canvas and [srcX]/[srcY] where this
+     * session's source crop starts on the full frame. Call before [renderBitmap].
+     */
+    external fun setRenderWindow(
+        session: Long, fullW: Int, fullH: Int,
+        winX: Int, winY: Int, winW: Int, winH: Int,
+        srcX: Int, srcY: Int, srcW: Int, srcH: Int,
+    ): Boolean
+
+    /**
+     * The film canvas and gate quads a whole frame of [width] x [height] lays
+     * out, without rendering. Same JSON as the engine's `spk_overscan_geometry`.
+     */
+    external fun overscanLayout(session: Long, width: Int, height: Int): String?
+
     /** Tier is "live", "preview" or "full". */
     external fun renderBitmap(session: Long, tier: String): Bitmap?
 

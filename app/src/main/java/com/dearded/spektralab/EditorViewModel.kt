@@ -31,6 +31,8 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.abs
+import kotlin.math.ceil
+import kotlin.math.floor
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -1108,9 +1110,13 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
      * 相纸边框（留白、输出比例、打孔条、参数条）在整幅拼接完成后套一次，
      * 所以边框也是全分辨率，和预览用同一份 FrameSpec。
      *
-     * 只支持手机照片（JPEG/PNG/HEIC，8 位 SDR），且不含片边、日期、裁切/
-     * 旋转、光晕、眩光、暗角、蒙版和灰尘：片边和日期由引擎按整幅画布绘制，
-     * 其余是跨块效果，分块后会切开。RAW 需要原生裁切。输出 JPEG。
+     * 片边（135）走引擎的窗口渲染：布局按整幅画布生成，每次只派发画布上的
+     * 一块窗口，因此齿孔间距、片基和边缘字跨块一致。片边画布比画面大，块
+     * 按画布切，源图按引擎给的片门四角反算。
+     *
+     * 只支持手机照片（JPEG/PNG/HEIC，8 位 SDR），且不含日期、旋转/翻转、
+     * 光晕、眩光、暗角、蒙版和灰尘；片边时还要求关闭颗粒。其余是跨块效果，
+     * 分块后会切开。RAW 需要原生裁切。输出 JPEG。
      */
     suspend fun exportTiled(): String {
         val state = _ui.value
@@ -1121,11 +1127,12 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
         if (engineHandle == 0L) return "引擎还没准备好"
         val catalog = state.catalog
         val base = state.edit
-        if (base.filmEdge) return "分块导出暂不支持片边，请先关闭「片边」"
         if (base.dateImprint) return "分块导出暂不支持日期，请先关闭「日期」"
-        if (base.quarterTurns != 0 || base.flipH || base.cropX != 0.0 || base.cropY != 0.0 ||
-            base.cropW != 1.0 || base.cropH != 1.0
-        ) return "分块导出暂不支持裁切和旋转，请先恢复整幅"
+        if (base.quarterTurns != 0 || base.flipH) return "分块导出暂不支持旋转和翻转，请先恢复整幅"
+        // 片边会把画面裁到片门（withFilmEdge），所以只有片边时允许非整幅裁切；
+        // 那块裁切由 App 从整幅源图切出来，tile 参数里的 geometry crop 是 identity。
+        if (!base.filmEdge && (base.cropX != 0.0 || base.cropY != 0.0 || base.cropW != 1.0 || base.cropH != 1.0))
+            return "分块导出暂不支持裁切，请先恢复整幅"
         if (base.noFilm) return "分块导出暂不支持「无胶片」，请先选择胶片和相纸"
         if (base.halationActive) return "分块导出暂不支持光晕，请先关闭「光晕」"
         if (base.glareActive) return "分块导出暂不支持眩光，请先关闭「眩光」"
@@ -1135,10 +1142,16 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
         val film = base.film.takeIf { it.isNotEmpty() && catalog.film(it) != null }
             ?: return "请先在编辑器里选择胶片"
         val edit = withFilm(base, catalog, film)?.let { catalog.normalize(it) } ?: return "胶片不可用：$film"
+        val edgeOn = edit.filmEdge
+        // 颗粒按每块的局部像素和每个 session 的种子生成，窗口之间接不上；
+        // 片边这一版先要求关闭。光晕/眩光在上面已经一律拒绝。
+        if (edgeOn && edit.grainActive && edit.grainAmount != 0.0)
+            return "分块导出片边暂不支持颗粒，请先在「胶片效果」里关闭颗粒"
 
         var full: Photo? = null
         var canvasBitmap: Bitmap? = null
         var meterSession = 0L
+        var layoutSession = 0L
         val started = SystemClock.elapsedRealtime()
         try {
             // 整幅解码一次：分块从它裁剪，测光也从它缩小，两者来自同一像素源。
@@ -1152,10 +1165,60 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
             val h = source.height
             if (w < 256 || h < 256) return "照片太小，分块导出没有意义"
 
-            // 相纸边框在拼接后按整幅成图绘制。先按整幅打印尺寸算好成图大小，
-            // 超出画布预算就在这里说明，而不是等到 OOM。
+            // 片边时引擎的「整幅画面」是裁到片门后的那一块；片门矩形只在这里
+            // 算一次，布局、切块和片边画布都用它。tile session 的 geometry crop
+            // 是 identity，因为窗口是从这块源图上直接切下来的。
+            val gateX = if (edgeOn) (edit.cropX * w).roundToInt().coerceIn(0, w - 1) else 0
+            val gateY = if (edgeOn) (edit.cropY * h).roundToInt().coerceIn(0, h - 1) else 0
+            val frameW = if (edgeOn) (edit.cropW * w).roundToInt().coerceIn(1, w - gateX) else w
+            val frameH = if (edgeOn) (edit.cropH * h).roundToInt().coerceIn(1, h - gateY) else h
+            val tileEdit = if (edgeOn) {
+                edit.copy(cropX = 0.0, cropY = 0.0, cropW = 1.0, cropH = 1.0, cropAspect = 0.0)
+            } else edit
+
+            // 片边的画布（片基、齿孔、边缘字、漏光）由引擎按整幅画布生成，
+            // 逐块渲染会每块各画一圈。这里先在 8×8 的空图上问一次布局，拿到
+            // 画布尺寸和片门四角，再按画布切窗口；每个窗口都带整幅 frame 尺寸，
+            // 布局因此与预览一致。
+            var canvasW = frameW
+            var canvasH = frameH
+            var vertical = false
+            val gateQuad = DoubleArray(8)
+            if (edgeOn) {
+                val layoutJson = withContext(ExportThread.dispatcher) {
+                    val probe = Bitmap.createBitmap(8, 8, Bitmap.Config.ARGB_8888)
+                    val opened = openPhotoSession(
+                        engineHandle,
+                        Photo(probe, photo.space, sourceWidth = 8, sourceHeight = 8),
+                        state.highlightStops,
+                    ) { space, linear ->
+                        Edit.openingParams(tileEdit, inputSpace = space, linear = linear).toString()
+                    }
+                    layoutSession = opened.handle
+                    if (layoutSession == 0L) null else NativeEngine.overscanLayout(layoutSession, frameW, frameH)
+                }
+                if (layoutSession == 0L) return "片边布局失败：${NativeEngine.lastError()}"
+                if (layoutJson == null) return "片边布局失败：${NativeEngine.lastError()}"
+                val layout = runCatching { JSONObject(layoutJson) }.getOrNull()
+                    ?: return "片边布局失败：引擎返回的布局不是 JSON"
+                if (!layout.optBoolean("valid")) return "片边布局失败：引擎没有给出片边画布"
+                canvasW = layout.optInt("canvas_w", 0)
+                canvasH = layout.optInt("canvas_h", 0)
+                if (canvasW <= 0 || canvasH <= 0) return "片边布局失败：片边画布尺寸为 0"
+                vertical = layout.optBoolean("vertical", false)
+                val q = layout.optJSONArray("gates")?.optJSONArray(0)
+                    ?: return "片边布局失败：引擎没有给出片门位置"
+                if (q.length() < 8) return "片边布局失败：片门位置不完整"
+                for (i in 0 until 8) gateQuad[i] = q.optDouble(i, 0.0)
+                log("tiled export: film edge $frameW×$frameH -> canvas $canvasW×$canvasH vertical=$vertical")
+                withContext(NonCancellable + ExportThread.dispatcher) { NativeEngine.release(layoutSession) }
+                layoutSession = 0L
+            }
+
+            // 相纸边框在拼接后按整幅成图绘制。先按片边画布（没有片边时就是
+            // 画面本身）算好成图大小，超出画布预算就在这里说明，而不是等到 OOM。
             val frame = base.frame
-            val frameLayout = if (frame.isNone) null else frame.layout(w, h)
+            val frameLayout = if (frame.isNone) null else frame.layout(canvasW, canvasH)
             if (frameLayout != null) {
                 val framedPixels = frameLayout.width.toLong() * frameLayout.height
                 if (framedPixels > TILED_FRAME_MAX_PIXELS) {
@@ -1203,39 +1266,84 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
             // 每块不超过设备的像素上限和长边；块外留一圈重叠，拼接时裁掉。
             // 所有块都取 tileW×tileH 并贴边，边缘的块向左/向上多取，而不是
             // 变窄变小——统一的块尺寸让胶片按微米算的效果保持同一比例。
+            // 片边时的块是**画布**上的窗口（片基比画面大），所以按画布算。
             val cap = state.maxPixels.takeIf { it > 0 } ?: 8_388_608L
-            val edge = (state.workingEdge.takeIf { it > 0 } ?: 3072).coerceIn(1024, 3072)
-            val tileW = min(w, edge)
-            val tileH = min(h, min(edge, (cap / tileW).toInt().coerceAtLeast(1)))
+            val workingEdge = (state.workingEdge.takeIf { it > 0 } ?: 3072).coerceIn(1024, 3072)
+            val tileW = min(canvasW, workingEdge)
+            val tileH = min(canvasH, min(workingEdge, (cap / tileW).toInt().coerceAtLeast(1)))
             if (tileW < 256 || tileH < 256) return "可用内存太小，无法切块"
             val ov = min(160, min(tileW, tileH) / 4)
             val coreW = max(1, tileW - 2 * ov)
             val coreH = max(1, tileH - 2 * ov)
-            val cols = (w + coreW - 1) / coreW
-            val rows = (h + coreH - 1) / coreH
+            val cols = (canvasW + coreW - 1) / coreW
+            val rows = (canvasH + coreH - 1) / coreH
+
+            // 片门四角到画面像素的仿射（canvas → frame）。四角按胶片的
+            // (s0,t0),(s1,t0),(s1,t1),(s0,t1) 给：landscape 时它们就是画面的
+            // (0,0)、(w,0)、(w,h)、(0,h)；vertical 时胶片沿画面 y 走，画面的
+            // (0,0) 落在第 4 个角上，x 沿 −t、y 沿 +s。
+            val p00x = if (vertical) gateQuad[6] * canvasW else gateQuad[0] * canvasW
+            val p00y = if (vertical) gateQuad[7] * canvasH else gateQuad[1] * canvasH
+            val p10x = if (vertical) gateQuad[0] * canvasW else gateQuad[2] * canvasW
+            val p10y = if (vertical) gateQuad[1] * canvasH else gateQuad[3] * canvasH
+            val p01x = if (vertical) gateQuad[4] * canvasW else gateQuad[6] * canvasW
+            val p01y = if (vertical) gateQuad[5] * canvasH else gateQuad[7] * canvasH
+            val axx = p10x - p00x
+            val axy = p10y - p00y
+            val ayx = p01x - p00x
+            val ayy = p01y - p00y
+            val det = axx * ayy - ayx * axy
+            if (edgeOn && abs(det) < 1e-9) return "片边布局失败：片门位置退化"
+            fun frameX(cx: Double, cy: Double) =
+                frameW * ((cx - p00x) * ayy - (cy - p00y) * ayx) / det
+            fun frameY(cx: Double, cy: Double) =
+                frameH * (axx * (cy - p00y) - axy * (cx - p00x)) / det
 
             val canvasSpace = if (state.wideGamut) {
                 ColorSpace.get(ColorSpace.Named.DISPLAY_P3)
             } else {
                 ColorSpace.get(ColorSpace.Named.SRGB)
             }
-            val canvasBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888, false, canvasSpace)
+            val canvasBmp = Bitmap.createBitmap(canvasW, canvasH, Bitmap.Config.ARGB_8888, false, canvasSpace)
             canvasBitmap = canvasBmp
             val canvas = Canvas(canvasBmp)
             val paint = Paint().apply { isFilterBitmap = false }
             val target = if (state.wideGamut) "Display P3" else "sRGB"
             var done = 0
             for (row in 0 until rows) for (col in 0 until cols) {
-                val cx0 = col * coreW
-                val cy0 = row * coreH
-                val cx1 = min(w, cx0 + coreW)
-                val cy1 = min(h, cy0 + coreH)
-                if (cx0 >= cx1 || cy0 >= cy1) continue
-                val x0 = min(max(0, cx0 - ov), max(0, w - tileW))
-                val y0 = min(max(0, cy0 - ov), max(0, h - tileH))
-                val x1 = min(w, x0 + tileW)
-                val y1 = min(h, y0 + tileH)
-                var crop: Bitmap? = Bitmap.createBitmap(source, x0, y0, x1 - x0, y1 - y0)
+                val ccx0 = col * coreW
+                val ccy0 = row * coreH
+                val ccx1 = min(canvasW, ccx0 + coreW)
+                val ccy1 = min(canvasH, ccy0 + coreH)
+                if (ccx0 >= ccx1 || ccy0 >= ccy1) continue
+                val winX = min(max(0, ccx0 - ov), max(0, canvasW - tileW))
+                val winY = min(max(0, ccy0 - ov), max(0, canvasH - tileH))
+                val winW = min(canvasW - winX, tileW)
+                val winH = min(canvasH - winY, tileH)
+                // 窗口对应的源图矩形：片边时按 canvas→frame 仿射取窗口四角的
+                // bbox，向外取整并留 2 px 余量（双线性采样要读到邻点），再
+                // clamp 到画幅；没有片边时窗口就是源图矩形。
+                var sx = winX
+                var sy = winY
+                var sw = winW
+                var sh = winH
+                if (edgeOn) {
+                    var minFx = Double.MAX_VALUE
+                    var minFy = Double.MAX_VALUE
+                    var maxFx = -Double.MAX_VALUE
+                    var maxFy = -Double.MAX_VALUE
+                    for (px in intArrayOf(winX, winX + winW)) for (py in intArrayOf(winY, winY + winH)) {
+                        val fx = frameX(px.toDouble(), py.toDouble())
+                        val fy = frameY(px.toDouble(), py.toDouble())
+                        minFx = min(minFx, fx); minFy = min(minFy, fy)
+                        maxFx = max(maxFx, fx); maxFy = max(maxFy, fy)
+                    }
+                    sx = (floor(minFx) - 2.0).toInt().coerceIn(0, frameW - 1)
+                    sy = (floor(minFy) - 2.0).toInt().coerceIn(0, frameH - 1)
+                    sw = (ceil(maxFx) + 2.0).toInt().coerceIn(sx + 1, frameW) - sx
+                    sh = (ceil(maxFy) + 2.0).toInt().coerceIn(sy + 1, frameH) - sy
+                }
+                var crop: Bitmap? = Bitmap.createBitmap(source, gateX + sx, gateY + sy, sw, sh)
                 if (crop === source) {
                     crop = source.copy(Bitmap.Config.ARGB_8888, false)
                         ?: return "分块导出失败：无法复制整幅分块"
@@ -1245,10 +1353,10 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
                     val opened = withContext(ExportThread.dispatcher) {
                         openPhotoSession(
                             engineHandle,
-                            Photo(crop!!, photo.space, sourceWidth = x1 - x0, sourceHeight = y1 - y0),
+                            Photo(crop!!, photo.space, sourceWidth = sw, sourceHeight = sh),
                             state.highlightStops,
                         ) { space, linear ->
-                            val p = Edit.openingParams(edit, inputSpace = space, linear = linear)
+                            val p = Edit.openingParams(tileEdit, inputSpace = space, linear = linear)
                             p.put("auto_exposure", false)
                             if (edit.autoExposure) p.put("exposure_baseline_ev", solvedEv)
                             p.toString()
@@ -1258,6 +1366,13 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
                     crop = null // openPhotoSession 已接管这块源图
                     if (handle == 0L) return "分块导出失败：${NativeEngine.lastError()}"
                     val tile = withContext(ExportThread.dispatcher) {
+                        // 片边：告诉引擎这块画布窗口在整幅画布上的位置，以及
+                        // 这块源图在整幅画面上的位置。布局仍是整幅的，所以齿孔
+                        // 间距、片基颜色和边缘字跨块一致。
+                        val windowed = !edgeOn || NativeEngine.setRenderWindow(
+                            handle, frameW, frameH, winX, winY, winW, winH, sx, sy, sw, sh,
+                        )
+                        if (!windowed) return@withContext null
                         if (!NativeEngine.setOutput(handle, target, true)) return@withContext null
                         // 调整层是逐像素的（暗角/蒙版/灰尘已在上面排除），
                         // 每块应用同一份，拼接后与整幅一致。
@@ -1269,21 +1384,21 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
                         }
                         NativeEngine.renderBitmap(handle, "full")
                     } ?: return "分块导出失败：${NativeEngine.lastError()}"
-                    if (tile.width != x1 - x0 || tile.height != y1 - y0) {
+                    if (tile.width != winW || tile.height != winH) {
                         val got = "${tile.width}×${tile.height}"
                         tile.recycle()
-                        return "分块导出失败：输出 $got 与分块 ${x1 - x0}×${y1 - y0} 不一致"
+                        return "分块导出失败：输出 $got 与分块 ${winW}×${winH} 不一致"
                     }
                     // 只把这块的核心区域放回去，重叠留在边缘。
                     canvas.drawBitmap(
                         tile,
-                        Rect(cx0 - x0, cy0 - y0, cx1 - x0, cy1 - y0),
-                        Rect(cx0, cy0, cx1, cy1),
+                        Rect(ccx0 - winX, ccy0 - winY, ccx1 - winX, ccy1 - winY),
+                        Rect(ccx0, ccy0, ccx1, ccy1),
                         paint,
                     )
                     tile.recycle()
                     done++
-                    log("tiled export: tile $done/${rows * cols} ${x1 - x0}x${y1 - y0}")
+                    log("tiled export: tile $done/${rows * cols} ${winW}x${winH}")
                 } finally {
                     if (handle != 0L) withContext(NonCancellable + ExportThread.dispatcher) {
                         NativeEngine.release(handle)
@@ -1330,7 +1445,11 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
             val text = buildString {
                 append("分块导出完成\n")
                 append("来源：${src.kind.uppercase(Locale.ROOT)} ${src.sourceWidth}×${src.sourceHeight}\n")
-                append("画面：$w×$h（%.1f MP）\n".format(Locale.ROOT, w.toDouble() * h / 1_000_000.0))
+                append("画面：$frameW×$frameH（%.1f MP）\n".format(Locale.ROOT, frameW.toDouble() * frameH / 1_000_000.0))
+                if (edgeOn) {
+                    append(("片边画布：$canvasW×$canvasH（%.1f MP）· ${edit.edgeFormat}\n")
+                        .format(Locale.ROOT, canvasW.toDouble() * canvasH / 1_000_000.0))
+                }
                 if (!frame.isNone) {
                     val label = Borders.byId(frame.id)?.label ?: "自定义边框"
                     append(("边框：$label · 成图 ${output.width}×${output.height}（%.1f MP）\n")
@@ -1354,6 +1473,12 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
             if (meterSession != 0L) {
                 try {
                     withContext(NonCancellable + ExportThread.dispatcher) { NativeEngine.release(meterSession) }
+                } catch (_: Throwable) {
+                }
+            }
+            if (layoutSession != 0L) {
+                try {
+                    withContext(NonCancellable + ExportThread.dispatcher) { NativeEngine.release(layoutSession) }
                 } catch (_: Throwable) {
                 }
             }

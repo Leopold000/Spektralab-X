@@ -1339,6 +1339,55 @@ JNI_FN(jstring, solve)(JNIEnv* env, jobject, jlong handle, jstring target_j) {
     return nullptr;
 }
 
+// Patch 0054 at the app boundary: one window of the film canvas. A tiled
+// film-edge export lays the whole canvas out once, cuts it into windows and
+// gives each session its own window plus the frame rectangle that session's
+// source holds. All sizes are pixels of the full frame.
+JNI_FN(jboolean, setRenderWindow)(JNIEnv*, jobject, jlong handle,
+                                  jint full_w, jint full_h,
+                                  jint win_x, jint win_y, jint win_w, jint win_h,
+                                  jint src_x, jint src_y, jint src_w, jint src_h) {
+    auto* s = reinterpret_cast<Session*>(handle);
+    if (!s) { fail("no session"); return JNI_FALSE; }
+    try {
+        if (full_w <= 0 || full_h <= 0 || win_w <= 0 || win_h <= 0 || src_w <= 0 || src_h <= 0) {
+            fail("render window: sizes must be positive");
+            return JNI_FALSE;
+        }
+        const spk_status st = spk_set_render_window(
+            s->session, uint32_t(full_w), uint32_t(full_h),
+            uint32_t(win_x), uint32_t(win_y), uint32_t(win_w), uint32_t(win_h),
+            uint32_t(src_x), uint32_t(src_y), uint32_t(src_w), uint32_t(src_h));
+        if (st != SPK_OK) { fail(engine_error("render window")); return JNI_FALSE; }
+        return JNI_TRUE;
+    } catch (const std::exception& e) {
+        fail(std::string("render window: ") + e.what());
+    } catch (...) {
+        fail("render window: unknown failure");
+    }
+    return JNI_FALSE;
+}
+
+// The film canvas and gate quads for a whole frame of this size, without
+// rendering: the tiled film-edge export asks before it cuts the frame up.
+JNI_FN(jstring, overscanLayout)(JNIEnv* env, jobject, jlong handle, jint width, jint height) {
+    auto* s = reinterpret_cast<Session*>(handle);
+    if (!s) { fail("no session"); return nullptr; }
+    try {
+        if (width <= 0 || height <= 0) { fail("overscan layout: the frame is empty"); return nullptr; }
+        char* reply = nullptr;
+        const spk_status st = spk_overscan_layout_at(s->session, uint32_t(width), uint32_t(height), &reply);
+        std::unique_ptr<char, decltype(&spk_string_free)> owned(reply, &spk_string_free);
+        if (st != SPK_OK) { fail(engine_error("overscan layout")); return nullptr; }
+        return jstr(env, reply ? reply : "{}");
+    } catch (const std::exception& e) {
+        fail(std::string("overscan layout: ") + e.what());
+    } catch (...) {
+        fail("overscan layout: unknown failure");
+    }
+    return nullptr;
+}
+
 // `r` into `reuse` when it is the same size, else into a new Bitmap.
 jobject pack_into(JNIEnv* env, const spk_result& r, jobject reuse, const spk::android::Layer2* look,
                   const spk::android::OutputTransform* xf, const float* rgb = nullptr,
