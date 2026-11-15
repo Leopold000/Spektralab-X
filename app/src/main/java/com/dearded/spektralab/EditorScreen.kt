@@ -956,6 +956,7 @@ private fun Controls(
                                     if (e.dateImprint) "日期" else null,
                                 ).joinToString(" · "),
                             )
+                        BorderFavoriteRow(ui, vm, enabled && src != null)
                         BorderPicker(e.borderId, enabled && src != null, noFilm = e.noFilm) { p ->
                             if (src != null) vm.update(Edit.withBorder(e, p, src.width, src.height))
                         }

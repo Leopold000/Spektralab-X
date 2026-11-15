@@ -85,6 +85,8 @@ data class UiState(
     val canUndo: Boolean = false,
     val canRedo: Boolean = false,
     val presets: List<Preset> = emptyList(),
+    /** 常用边框: saved border combinations, in the order saved. */
+    val borderFavorites: List<BorderFavorite> = emptyList(),
     /** The 正在处理 sheet is open. */
     val showQueue: Boolean = false,
     /** The open photo's shooting data, for the paper frame's caption. */
@@ -108,6 +110,7 @@ class EngineException(message: String, val errorCode: String = ErrorCodes.ENGINE
 class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
     private val prefs = app.getSharedPreferences("settings", 0)
     private val presetStore = PresetStore(prefs)
+    private val borderFavoriteStore = BorderFavoriteStore(prefs)
     private val _ui = MutableStateFlow(UiState(workingEdge = prefs.getInt("working_edge", 4096),
         wideGamut = prefs.getBoolean("wide_gamut", true),
         highlightStops = prefs.getFloat("highlight_stops_v2", 0f),
@@ -729,6 +732,31 @@ class EditorViewModel(private val app: Application) : AndroidViewModel(app) {
     }
 
     fun deletePreset(name: String) = _ui.update { it.copy(presets = presetStore.delete(name)) }
+
+    // --- 常用边框: the border combination only, never crop or exposure ---
+
+    fun loadBorderFavorites() = _ui.update { it.copy(borderFavorites = borderFavoriteStore.load()) }
+
+    fun saveBorderFavorite(name: String) {
+        val clean = name.trim().take(40)
+        if (clean.isEmpty()) return
+        val list = borderFavoriteStore.save(BorderFavorite.of(clean, _ui.value.edit))
+        _ui.update { it.copy(borderFavorites = list, message = "已保存常用边框“$clean”") }
+    }
+
+    fun applyBorderFavorite(favorite: BorderFavorite) {
+        val state = _ui.value
+        val src = state.source ?: return
+        // 胶片「无」has no edge to draw; say so rather than turn on a switch the page disables.
+        if (favorite.filmEdge && state.edit.noFilm) {
+            _ui.update { it.copy(message = "这个常用边框带片边，先选一卷胶卷再用") }
+            return
+        }
+        update(favorite.applyTo(state.edit, src.width, src.height))
+    }
+
+    fun deleteBorderFavorite(name: String) =
+        _ui.update { it.copy(borderFavorites = borderFavoriteStore.delete(name)) }
 
     fun pickFilm(id: String) {
         val state = _ui.value
